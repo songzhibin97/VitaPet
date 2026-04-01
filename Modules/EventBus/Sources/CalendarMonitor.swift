@@ -1,4 +1,4 @@
-import EventKit
+@preconcurrency import EventKit
 import Foundation
 
 @MainActor
@@ -61,7 +61,16 @@ public final class CalendarMonitor: EventSource, @unchecked Sendable {
     }
 
     private func requestCalendarAccess() async throws -> Bool {
-        try await eventStore.requestFullAccessToEvents()
+        try await withCheckedThrowingContinuation { continuation in
+            eventStore.requestFullAccessToEvents { granted, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+
+                continuation.resume(returning: granted)
+            }
+        }
     }
 
     private func resetStateAfterStartFailure() {
