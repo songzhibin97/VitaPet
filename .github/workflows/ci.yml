@@ -28,18 +28,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          for target in \
-            RenderEngineTests \
-            EventBusTests \
-            PluginRuntimeTests \
-            SecurityLayerTests \
-            FocusMonitorTests \
-            LocalizationTests \
-            PersistenceTests \
-            AIEngineTests \
-            ChatUITests
+          for filter in \
+            "RenderEngineTests" \
+            "EventBusTests.AppReactionRulesTests" \
+            "EventBusTests.CalendarMonitorTests" \
+            "EventBusTests.ClipboardMonitorTests" \
+            "EventBusTests.EventBusTests" \
+            "EventBusTests.FSEventsMonitorTests" \
+            "EventBusTests.GitHubMonitorTests" \
+            "EventBusTests.KeyboardMonitorTests" \
+            "EventBusTests.NotificationMonitorTests" \
+            "EventBusTests.TimerSourceTests" \
+            "EventBusTests.WebhookServerTests" \
+            "EventBusTests.WorkspaceMonitorTests" \
+            "PluginRuntimeTests" \
+            "SecurityLayerTests" \
+            "FocusMonitorTests" \
+            "LocalizationTests" \
+            "PersistenceTests" \
+            "AIEngineTests" \
+            "ChatUITests"
           do
-            echo "::group::swift test ${target}"
-            swift test --filter "^${target}\\."
+            echo "::group::swift test ${filter}"
+            swift test --filter "${filter}"
             echo "::endgroup::"
           done
