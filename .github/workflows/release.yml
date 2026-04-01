@@ -34,6 +34,6 @@ jobs:
           zip -r "../VitaPet-${VERSION}-macos.zip" .
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           files: VitaPet-${{ github.ref_name }}-macos.zip
