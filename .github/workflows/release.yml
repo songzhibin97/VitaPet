@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Release
+        run: swift build -c release
+
+      - name: Package
+        run: |
+          BUILD_DIR=".build/release"
+          APP_NAME="VitaPetApp"
+          VERSION="${{ github.ref_name }}"
+
+          mkdir -p dist
+          cp "$BUILD_DIR/$APP_NAME" dist/
+          cp -r "$BUILD_DIR/VitaPet_Localization.bundle" dist/ 2>/dev/null || true
+          cp -r "$BUILD_DIR/VitaPet_RenderEngine.bundle" dist/ 2>/dev/null || true
+          cp LICENSE dist/
+          cp README.md dist/
+
+          cd dist
+          zip -r "../VitaPet-${VERSION}-macos.zip" .
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: VitaPet-${{ github.ref_name }}-macos.zip

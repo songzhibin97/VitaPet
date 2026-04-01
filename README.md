@@ -39,7 +39,11 @@ VitaPet 使用 `Swift 6`、`SpriteKit`、`AppKit`、`SwiftUI` 构建，支持最
 | Swift | `Swift 6+` |
 | 构建方式 | `swift build` |
 
-### 获取源码并构建
+### 方式 1：下载 Release
+
+从 [GitHub Releases](https://github.com/Songzhibin/VitaPet/releases/latest) 下载最新版 `.zip`，解压后运行 `VitaPetApp`。
+
+### 方式 2：从源码构建
 
 ```bash
 git clone https://github.com/Songzhibin/VitaPet.git
