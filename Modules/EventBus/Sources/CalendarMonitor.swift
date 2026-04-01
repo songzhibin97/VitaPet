@@ -9,6 +9,7 @@ public final class CalendarMonitor: EventSource, @unchecked Sendable {
     private var isRunning = false
     private var checkTimer: Timer?
     private let eventStore = EKEventStore()
+    private let requestAccessHandler: @MainActor @Sendable (EKEventStore) async throws -> Bool
     private var remindedEventIDs: Set<String> = []
     private let lookAheadMinutes: Int
     private let checkIntervalSeconds: TimeInterval
@@ -17,6 +18,17 @@ public final class CalendarMonitor: EventSource, @unchecked Sendable {
         lookAheadMinutes: Int = 15,
         checkIntervalSeconds: TimeInterval = 300
     ) {
+        self.requestAccessHandler = Self.defaultRequestAccess
+        self.lookAheadMinutes = lookAheadMinutes
+        self.checkIntervalSeconds = checkIntervalSeconds
+    }
+
+    init(
+        lookAheadMinutes: Int = 15,
+        checkIntervalSeconds: TimeInterval = 300,
+        requestAccessHandler: @escaping @MainActor @Sendable (EKEventStore) async throws -> Bool
+    ) {
+        self.requestAccessHandler = requestAccessHandler
         self.lookAheadMinutes = lookAheadMinutes
         self.checkIntervalSeconds = checkIntervalSeconds
     }
@@ -61,6 +73,10 @@ public final class CalendarMonitor: EventSource, @unchecked Sendable {
     }
 
     private func requestCalendarAccess() async throws -> Bool {
+        try await requestAccessHandler(eventStore)
+    }
+
+    private static func defaultRequestAccess(_ eventStore: EKEventStore) async throws -> Bool {
         try await withCheckedThrowingContinuation { continuation in
             eventStore.requestFullAccessToEvents { granted, error in
                 if let error {
