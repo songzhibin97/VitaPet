@@ -690,15 +690,20 @@ public final class PetWindowController: NSWindowController {
             let progress = Double(stepState.value) / Double(steps)
             let x = start.x + (target.x - start.x) * progress
             let y = start.y + (target.y - start.y) * progress
-            MainActor.assumeIsolated {
-                window.setFrameOrigin(NSPoint(x: x, y: y))
-                self?.repositionBubble()
-            }
-            if stepState.value >= steps {
+            let shouldFinish = stepState.value >= steps
+            if shouldFinish {
                 timer.invalidate()
-                MainActor.assumeIsolated {
-                    self?.debugMoveTimer = nil
-                    window.setFrameOrigin(target)
+            }
+            Task { @MainActor [weak self] in
+                guard let self, let window = self.window else {
+                    return
+                }
+
+                window.setFrameOrigin(shouldFinish ? target : NSPoint(x: x, y: y))
+                self.repositionBubble()
+
+                if shouldFinish {
+                    self.debugMoveTimer = nil
                 }
             }
         }
@@ -997,7 +1002,7 @@ public final class PetWindowController: NSWindowController {
         isExecutingBehavior = true
         let isJump = behaviorEngine.behaviorDefinition(for: behaviorName)?.type == .jump
         let onMove: @Sendable (NSPoint, TimeInterval) -> Void = { [weak self] target, duration in
-            MainActor.assumeIsolated {
+            Task { @MainActor [weak self] in
                 guard let self, let window = self.window else { return }
                 guard duration > 0 else {
                     window.setFrameOrigin(target)
@@ -1015,15 +1020,21 @@ public final class PetWindowController: NSWindowController {
                     let progress = Double(stepState.value) / Double(steps)
                     let x = start.x + (target.x - start.x) * progress
                     let y = start.y + (target.y - start.y) * progress
-                    MainActor.assumeIsolated {
-                        window.setFrameOrigin(NSPoint(x: x, y: y))
-                        self?.repositionBubble()
-                    }
-                    if stepState.value >= steps {
+                    let shouldFinish = stepState.value >= steps
+                    if shouldFinish {
                         timer.invalidate()
-                        MainActor.assumeIsolated {
-                            self?.movementTimer = nil
-                            window.setFrameOrigin(target)
+                    }
+
+                    Task { @MainActor [weak self] in
+                        guard let self, let window = self.window else {
+                            return
+                        }
+
+                        window.setFrameOrigin(shouldFinish ? target : NSPoint(x: x, y: y))
+                        self.repositionBubble()
+
+                        if shouldFinish {
+                            self.movementTimer = nil
                         }
                     }
                 }
