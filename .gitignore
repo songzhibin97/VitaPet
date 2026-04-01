@@ -1,0 +1,89 @@
+# ai-clean:start - managed by ai-clean (do not edit this block)
+# AI Tools
+.cursor/
+.cursor-server/
+.cursorignore
+.cursorindexingignore
+.claude/
+.claude_output/
+CLAUDE.md
+CLAUDE.local.md
+.copilot/
+.github/copilot/
+.aider*
+.aider.tags.cache.v3/
+.continue/
+.continue.json
+.codeium/
+.tabnine/
+.tabnine_root
+.sourcery.yaml
+.cody/
+.cody.json
+.windsurf/
+.bolt/
+.v0/
+.codex/
+.prompts/
+.ai/
+.openspec/
+.devai/
+.gemini/
+.amazonq/
+.augment/
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+.secrets/
+secrets.yaml
+secrets.json
+*.secret
+.netrc
+.npmrc
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+# Build Artifacts
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+node_modules/
+.tox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+!web/dist/
+!web/dist/index.html
+# Cache / OS
+.DS_Store
+Thumbs.db
+.cache/
+*.log
+# Swift / SPM
+.build/
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+*.resolved
+# Custom
+.tmp
+config.yaml
+templates
+/data
+# ai-clean:end
