@@ -163,6 +163,35 @@ final class OllamaServiceTests: XCTestCase {
         XCTAssertEqual(messages[3]["content"], "你好")
     }
 
+    func testBuildOpenAICompatibleChatRequestUsesCompletionsEndpoint() throws {
+        let endpoint = URL(string: "http://127.0.0.1:8787")!
+
+        let request = try OllamaService.buildOpenAICompatibleChatRequest(
+            endpoint: endpoint,
+            model: "auto",
+            history: [],
+            systemPrompt: "You are helpful.",
+            userMessage: "Hello"
+        )
+
+        XCTAssertEqual(request.url?.absoluteString, "http://127.0.0.1:8787/v1/chat/completions")
+        XCTAssertEqual(request.httpMethod, "POST")
+    }
+
+    func testBuildOpenAICompatibleChatRequestKeepsExplicitCompletionsPath() throws {
+        let endpoint = URL(string: "http://127.0.0.1:8787/v1/chat/completions")!
+
+        let request = try OllamaService.buildOpenAICompatibleChatRequest(
+            endpoint: endpoint,
+            model: "auto",
+            history: [],
+            systemPrompt: "You are helpful.",
+            userMessage: "Hello"
+        )
+
+        XCTAssertEqual(request.url?.absoluteString, "http://127.0.0.1:8787/v1/chat/completions")
+    }
+
     func testParseChatResponse() throws {
         let line = #"{"model":"llama3.2","message":{"role":"assistant","content":"你"},"done":false}"#
 
@@ -401,6 +430,56 @@ final class OllamaServiceTests: XCTestCase {
         XCTAssertNil(updates[1].petName)
     }
 
+    func testSend_openAICompatibleBackendYieldsAssistantContent() async throws {
+        let service = OllamaService(
+            endpoint: URL(string: "http://unit.test")!,
+            model: "auto",
+            backend: .openAICompatible
+        )
+        let modelsObserved = expectation(description: "models endpoint observed")
+        let completionsObserved = expectation(description: "chat completions observed")
+
+        OllamaServiceURLProtocol.install { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+
+            if request.url?.path == "/v1/models" {
+                modelsObserved.fulfill()
+                return (response, Data(#"{"data":[]}"#.utf8))
+            }
+
+            if request.url?.path == "/v1/chat/completions" {
+                completionsObserved.fulfill()
+                let body = try XCTUnwrap(request.bodyDataForTesting())
+                let object = try XCTUnwrap(
+                    try JSONSerialization.jsonObject(with: body) as? [String: Any]
+                )
+                XCTAssertEqual(object["model"] as? String, "auto")
+                XCTAssertEqual(object["stream"] as? Bool, false)
+
+                let payload = Data(
+                    #"{"choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant","content":"你好呀"}}]}"#.utf8
+                )
+                return (response, payload)
+            }
+
+            return (response, Data("{}".utf8))
+        }
+
+        let stream = try await service.send(message: "你好")
+        var collected = ""
+        for try await chunk in stream {
+            collected += chunk
+        }
+
+        XCTAssertEqual(collected, "你好呀")
+        await fulfillment(of: [modelsObserved, completionsObserved], timeout: 1.0)
+    }
+
     func testUpdateConfig() async {
         let service = OllamaService(
             endpoint: URL(string: "http://localhost:11434")!,
@@ -408,10 +487,12 @@ final class OllamaServiceTests: XCTestCase {
         )
         let newEndpoint = URL(string: "http://127.0.0.1:11435")!
 
-        await service.updateConfig(endpoint: newEndpoint, model: "qwen2.5")
+        await service.updateConfig(endpoint: newEndpoint, model: "qwen2.5", backend: .openAICompatible)
 
         let config = await service.configSnapshot()
         XCTAssertEqual(config.endpoint, newEndpoint)
         XCTAssertEqual(config.model, "qwen2.5")
+        let backend = await service.backendSnapshot()
+        XCTAssertEqual(backend, .openAICompatible)
     }
 }

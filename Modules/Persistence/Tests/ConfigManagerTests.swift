@@ -46,6 +46,7 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertEqual(manager.config.pets[0].name, "Cat")
         XCTAssertEqual(manager.config.pets[0].spritePack, "default")
         XCTAssertTrue(manager.config.enabledCapabilities.isEmpty)
+        XCTAssertEqual(manager.config.aiBackend, "ollama")
         XCTAssertEqual(
             manager.config.locale,
             (Locale.preferredLanguages.first ?? Locale.current.identifier).hasPrefix("zh") ? "zh-Hans" : "en"
@@ -150,6 +151,7 @@ final class ConfigManagerTests: XCTestCase {
             disabledPlugins: ["demo.plugin"],
             locale: "en",
             ollamaEndpoint: "http://127.0.0.1:11435",
+            aiBackend: "openai-compatible",
             ollamaModel: "qwen2.5",
             aiSystemPrompt: "Be concise",
             aiProactiveEnabled: false,
@@ -169,6 +171,7 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertEqual(decoded.webhookEnabled, true)
         XCTAssertEqual(decoded.webhookPort, 18080)
         XCTAssertEqual(decoded.ollamaEndpoint, "http://127.0.0.1:11435")
+        XCTAssertEqual(decoded.aiBackend, "openai-compatible")
         XCTAssertEqual(decoded.ollamaModel, "qwen2.5")
         XCTAssertEqual(decoded.aiSystemPrompt, "Be concise")
         XCTAssertEqual(decoded.spaceMode, "singleSpace")
@@ -280,6 +283,7 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertEqual(decoded.pets[0].positionX, 210)
         XCTAssertEqual(decoded.pets[0].positionY, 240)
         XCTAssertEqual(decoded.selectedSpritePack, "legacy-pack")
+        XCTAssertEqual(decoded.aiBackend, "ollama")
     }
 
     func testUpdate_persistsMultiplePets() throws {

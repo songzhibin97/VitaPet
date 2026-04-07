@@ -1,4 +1,5 @@
 import AppKit
+import AIEngine
 import EventBus
 import Localization
 import SwiftUI
@@ -22,11 +23,12 @@ public final class ChatWindowController: NSWindowController {
     private var onCreateTemplate: @MainActor () async -> String? = { nil }
     private var onBuildSpritePack: @MainActor (String, [String: [URL]]) async -> String? = { _, _ in nil }
     private var aiEndpoint: @MainActor () -> String = { "http://localhost:11434" }
+    private var aiBackend: @MainActor () -> AIEngine.AIBackend = { .ollama }
     private var aiModel: @MainActor () -> String = { "llama3.2" }
     private var aiStatus: @MainActor () -> AIEngineStatus = { .notConfigured }
     private var aiSystemPrompt: @MainActor () -> String = { "" }
     private var onTestConnection: @MainActor () -> Void = {}
-    private var onSaveAIConfig: @MainActor (String, String, String) -> Void = { _, _, _ in }
+    private var onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend) -> Void = { _, _, _, _ in }
     private var githubToken: @MainActor () -> String = { "" }
     private var webhookEnabled: @MainActor () -> Bool = { false }
     private var webhookPort: @MainActor () -> Int = { 19280 }
@@ -142,6 +144,7 @@ public final class ChatWindowController: NSWindowController {
                 onRevealInFinder: onRevealInFinder,
                 onCreateTemplate: onCreateTemplate,
                 ollamaEndpoint: aiEndpoint(),
+                aiBackend: aiBackend(),
                 ollamaModel: aiModel(),
                 aiSystemPrompt: aiSystemPrompt(),
                 githubToken: githubToken(),
@@ -149,6 +152,7 @@ public final class ChatWindowController: NSWindowController {
                 webhookPort: webhookPort(),
                 webhookSecret: webhookSecret(),
                 aiStatus: aiStatus(),
+                aiStatusProvider: aiStatus,
                 onTestConnection: onTestConnection,
                 onSaveAIConfig: onSaveAIConfig,
                 onSaveNotificationConfig: onSaveNotificationConfig,
@@ -273,13 +277,15 @@ public final class ChatWindowController: NSWindowController {
 
     public func configureAISettings(
         aiEndpoint: @escaping @MainActor () -> String,
+        aiBackend: @escaping @MainActor () -> AIEngine.AIBackend,
         aiModel: @escaping @MainActor () -> String,
         aiSystemPrompt: @escaping @MainActor () -> String,
         aiStatus: @escaping @MainActor () -> AIEngineStatus,
         onTestConnection: @escaping @MainActor () -> Void = {},
-        onSaveAIConfig: @escaping @MainActor (String, String, String) -> Void = { _, _, _ in }
+        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend) -> Void = { _, _, _, _ in }
     ) {
         self.aiEndpoint = aiEndpoint
+        self.aiBackend = aiBackend
         self.aiModel = aiModel
         self.aiSystemPrompt = aiSystemPrompt
         self.aiStatus = aiStatus

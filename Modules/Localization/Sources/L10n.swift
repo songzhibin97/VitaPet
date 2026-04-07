@@ -26,6 +26,9 @@ public enum L10n {
     public static var settingsSpritePacks: String { tr("settings.sprite_packs") }
     public static var settingsAI: String { tr("settings.ai") }
     public static var settingsAIEndpoint: String { tr("settings.ai.endpoint") }
+    public static var settingsAIBackend: String { tr("settings.ai.backend") }
+    public static var settingsAIBackendOllama: String { tr("settings.ai.backend_ollama") }
+    public static var settingsAIBackendOpenAICompatible: String { tr("settings.ai.backend_openai_compatible") }
     public static var settingsAIModel: String { tr("settings.ai.model") }
     public static var settingsAITestConnection: String { tr("settings.ai.test_connection") }
     public static var settingsAISystemPrompt: String { tr("settings.ai.system_prompt") }

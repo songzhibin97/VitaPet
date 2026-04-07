@@ -40,6 +40,20 @@ public enum AIEngineStatus: Sendable {
     case error(String)
 }
 
+public enum AIBackend: String, Codable, Sendable, CaseIterable {
+    case ollama
+    case openAICompatible = "openai-compatible"
+
+    public var defaultModel: String {
+        switch self {
+        case .ollama:
+            return "llama3.2"
+        case .openAICompatible:
+            return "auto"
+        }
+    }
+}
+
 public struct OllamaTool: Codable, Sendable {
     public let type: String
     public let function: OllamaToolFunction

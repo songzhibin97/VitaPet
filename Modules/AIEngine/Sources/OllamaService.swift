@@ -34,13 +34,15 @@ public actor OllamaService: AIEngineProtocol {
     }
 
     private var endpoint: URL
+    private var backend: AIBackend
     private var model: String
     private var onConversationUpdated: (@Sendable (String, String, String, String?, String?) async -> Void)?
     private var currentStatus: AIEngineStatus = .notConfigured
 
-    public init(endpoint: URL, model: String) {
+    public init(endpoint: URL, model: String, backend: AIBackend = .ollama) {
         self.endpoint = endpoint
         self.model = model
+        self.backend = backend
     }
 
     public var status: AIEngineStatus {
@@ -52,20 +54,73 @@ public actor OllamaService: AIEngineProtocol {
     public func checkConnection() async {
         currentStatus = .connecting
 
+        switch backend {
+        case .ollama:
+            await checkOllamaConnection()
+        case .openAICompatible:
+            await checkOpenAICompatibleConnection()
+        }
+    }
+
+    private func checkOllamaConnection() async {
         do {
-            let url = endpoint.appendingPathComponent("api").appendingPathComponent("tags")
-            let request = URLRequest(url: url)
+            let url = Self.resolveOllamaTagsURL(from: endpoint)
+            var request = URLRequest(url: url)
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
 
             let (_, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,
                   (200...299).contains(httpResponse.statusCode) else {
-                currentStatus = .notConfigured
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+                currentStatus = .error("HTTP \(statusCode)")
                 return
             }
 
             currentStatus = .ready
         } catch {
-            currentStatus = .notConfigured
+            currentStatus = .error(error.localizedDescription)
+        }
+    }
+
+    private func checkOpenAICompatibleConnection() async {
+        do {
+            var request = URLRequest(url: Self.resolveOpenAIModelsURL(from: endpoint))
+            request.timeoutInterval = 8
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                throw OllamaServiceError.httpStatus((response as? HTTPURLResponse)?.statusCode ?? -1)
+            }
+
+            currentStatus = .ready
+            return
+        } catch {
+            do {
+                var request = try Self.buildOpenAICompatibleChatRequest(
+                    endpoint: endpoint,
+                    model: resolvedModelName(),
+                    history: [],
+                    systemPrompt: "You are a connection health check. Reply with ok.",
+                    userMessage: "ping",
+                    stream: false,
+                    maxTokens: 1
+                )
+                request.timeoutInterval = 120
+
+                let (_, response) = try await URLSession.shared.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse,
+                      (200...299).contains(httpResponse.statusCode) else {
+                    let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+                    currentStatus = .error("HTTP \(statusCode)")
+                    return
+                }
+
+                currentStatus = .ready
+            } catch {
+                currentStatus = .error(error.localizedDescription)
+            }
         }
     }
 
@@ -79,33 +134,68 @@ public actor OllamaService: AIEngineProtocol {
             }
         }
 
-        let request = try Self.buildChatRequest(
-            endpoint: endpoint,
-            model: model,
-            history: activeHistory,
-            systemPrompt: effectiveSystemPrompt,
-            userMessage: message
-        )
         let userMessage = ChatMessage(role: .user, content: message)
 
-        return AsyncThrowingStream<String, Error> { continuation in
-            Task {
-                do {
-                    let stream = try await URLSession.shared.bytes(for: request)
-                    let assistantMessage = try await self.consumeStream(
-                        bytes: stream.0,
-                        response: stream.1,
-                        continuation: continuation,
-                        onToolCall: nil
-                    )
+        switch backend {
+        case .ollama:
+            let request = try Self.buildChatRequest(
+                endpoint: endpoint,
+                model: model,
+                history: activeHistory,
+                systemPrompt: effectiveSystemPrompt,
+                userMessage: message
+            )
 
-                    self.recordConversation(
-                        userMessage: userMessage,
-                        assistantMessage: assistantMessage
-                    )
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+            return AsyncThrowingStream<String, Error> { continuation in
+                Task {
+                    do {
+                        let stream = try await URLSession.shared.bytes(for: request)
+                        let assistantMessage = try await self.consumeStream(
+                            bytes: stream.0,
+                            response: stream.1,
+                            continuation: continuation,
+                            onToolCall: nil
+                        )
+
+                        self.recordConversation(
+                            userMessage: userMessage,
+                            assistantMessage: assistantMessage
+                        )
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+        case .openAICompatible:
+            let request = try Self.buildOpenAICompatibleChatRequest(
+                endpoint: endpoint,
+                model: resolvedModelName(),
+                history: activeHistory,
+                systemPrompt: effectiveSystemPrompt,
+                userMessage: message,
+                stream: false
+            )
+
+            return AsyncThrowingStream<String, Error> { continuation in
+                Task {
+                    do {
+                        let (data, response) = try await URLSession.shared.data(for: request)
+                        let assistantMessage = try await self.consumeOpenAIResponse(
+                            data: data,
+                            response: response,
+                            continuation: continuation,
+                            onToolCall: nil
+                        )
+
+                        self.recordConversation(
+                            userMessage: userMessage,
+                            assistantMessage: assistantMessage
+                        )
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
                 }
             }
         }
@@ -125,34 +215,70 @@ public actor OllamaService: AIEngineProtocol {
             }
         }
 
-        let request = try Self.buildChatRequest(
-            endpoint: endpoint,
-            model: model,
-            history: activeHistory,
-            systemPrompt: effectiveSystemPrompt,
-            userMessage: message,
-            tools: tools
-        )
         let userMessage = ChatMessage(role: .user, content: message)
 
-        return AsyncThrowingStream<String, Error> { continuation in
-            Task {
-                do {
-                    let stream = try await URLSession.shared.bytes(for: request)
-                    let assistantMessage = try await self.consumeStream(
-                        bytes: stream.0,
-                        response: stream.1,
-                        continuation: continuation,
-                        onToolCall: onToolCall
-                    )
+        switch backend {
+        case .ollama:
+            let request = try Self.buildChatRequest(
+                endpoint: endpoint,
+                model: model,
+                history: activeHistory,
+                systemPrompt: effectiveSystemPrompt,
+                userMessage: message,
+                tools: tools
+            )
 
-                    self.recordConversation(
-                        userMessage: userMessage,
-                        assistantMessage: assistantMessage
-                    )
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+            return AsyncThrowingStream<String, Error> { continuation in
+                Task {
+                    do {
+                        let stream = try await URLSession.shared.bytes(for: request)
+                        let assistantMessage = try await self.consumeStream(
+                            bytes: stream.0,
+                            response: stream.1,
+                            continuation: continuation,
+                            onToolCall: onToolCall
+                        )
+
+                        self.recordConversation(
+                            userMessage: userMessage,
+                            assistantMessage: assistantMessage
+                        )
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+        case .openAICompatible:
+            let request = try Self.buildOpenAICompatibleChatRequest(
+                endpoint: endpoint,
+                model: resolvedModelName(),
+                history: activeHistory,
+                systemPrompt: effectiveSystemPrompt,
+                userMessage: message,
+                tools: tools,
+                stream: false
+            )
+
+            return AsyncThrowingStream<String, Error> { continuation in
+                Task {
+                    do {
+                        let (data, response) = try await URLSession.shared.data(for: request)
+                        let assistantMessage = try await self.consumeOpenAIResponse(
+                            data: data,
+                            response: response,
+                            continuation: continuation,
+                            onToolCall: onToolCall
+                        )
+
+                        self.recordConversation(
+                            userMessage: userMessage,
+                            assistantMessage: assistantMessage
+                        )
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
                 }
             }
         }
@@ -216,9 +342,10 @@ public actor OllamaService: AIEngineProtocol {
         currentSessionId = sessionId
     }
 
-    public func updateConfig(endpoint: URL, model: String) {
+    public func updateConfig(endpoint: URL, model: String, backend: AIBackend) {
         self.endpoint = endpoint
         self.model = model
+        self.backend = backend
         currentStatus = .notConfigured
     }
 
@@ -244,27 +371,53 @@ public actor OllamaService: AIEngineProtocol {
         }
 
         let systemPrompt = effectiveSystemPrompt + "\n你现在要主动和主人说话。根据当前情境说一句话。"
-        let request = try Self.buildChatRequest(
-            endpoint: endpoint,
-            model: model,
-            history: [],
-            systemPrompt: systemPrompt,
-            userMessage: context,
-            stream: false
-        )
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode) else {
-            throw OllamaServiceError.invalidResponse
+        switch backend {
+        case .ollama:
+            let request = try Self.buildChatRequest(
+                endpoint: endpoint,
+                model: model,
+                history: [],
+                systemPrompt: systemPrompt,
+                userMessage: context,
+                stream: false
+            )
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                throw OllamaServiceError.invalidResponse
+            }
+
+            guard let parsed = try? JSONDecoder().decode(NonStreamResponse.self, from: data),
+                  let content = parsed.message?.content else {
+                throw OllamaServiceError.invalidResponse
+            }
+
+            return content.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .openAICompatible:
+            let request = try Self.buildOpenAICompatibleChatRequest(
+                endpoint: endpoint,
+                model: resolvedModelName(),
+                history: [],
+                systemPrompt: systemPrompt,
+                userMessage: context,
+                stream: false
+            )
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                throw OllamaServiceError.invalidResponse
+            }
+
+            let chunk = try Self.parseOpenAIChatResponse(data)
+            guard let content = chunk.content else {
+                throw OllamaServiceError.invalidResponse
+            }
+
+            return content.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-
-        guard let parsed = try? JSONDecoder().decode(NonStreamResponse.self, from: data),
-              let content = parsed.message?.content else {
-            throw OllamaServiceError.invalidResponse
-        }
-
-        return content.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func extractMemories(from recentMessages: [(role: String, content: String)]) async throws -> [String] {
@@ -277,27 +430,52 @@ public actor OllamaService: AIEngineProtocol {
         let conversationText = recentMessages
             .map { "\($0.role): \($0.content)" }
             .joined(separator: "\n")
-        let request = try Self.buildChatRequest(
-            endpoint: endpoint,
-            model: model,
-            history: [],
-            systemPrompt: extractionPrompt,
-            userMessage: conversationText,
-            stream: false
-        )
+        switch backend {
+        case .ollama:
+            let request = try Self.buildChatRequest(
+                endpoint: endpoint,
+                model: model,
+                history: [],
+                systemPrompt: extractionPrompt,
+                userMessage: conversationText,
+                stream: false
+            )
 
-        let (responseData, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode) else {
-            return []
+            let (responseData, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                return []
+            }
+
+            let parsed = try? JSONDecoder().decode(NonStreamResponse.self, from: responseData)
+            guard let content = parsed?.message?.content else {
+                return []
+            }
+
+            return Self.parseMemoryArray(from: content)
+        case .openAICompatible:
+            let request = try Self.buildOpenAICompatibleChatRequest(
+                endpoint: endpoint,
+                model: resolvedModelName(),
+                history: [],
+                systemPrompt: extractionPrompt,
+                userMessage: conversationText,
+                stream: false
+            )
+
+            let (responseData, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                return []
+            }
+
+            let parsed = try? Self.parseOpenAIChatResponse(responseData)
+            guard let content = parsed?.content else {
+                return []
+            }
+
+            return Self.parseMemoryArray(from: content)
         }
-
-        let parsed = try? JSONDecoder().decode(NonStreamResponse.self, from: responseData)
-        guard let content = parsed?.message?.content else {
-            return []
-        }
-
-        return Self.parseMemoryArray(from: content)
     }
 
     internal static func buildChatRequest(
@@ -320,10 +498,41 @@ public actor OllamaService: AIEngineProtocol {
             tools: tools
         )
 
-        var request = URLRequest(url: endpoint.appendingPathComponent("api").appendingPathComponent("chat"))
+        var request = URLRequest(url: resolveOllamaChatURL(from: endpoint))
         request.httpMethod = "POST"
         request.httpBody = try JSONEncoder().encode(payload)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        return request
+    }
+
+    internal static func buildOpenAICompatibleChatRequest(
+        endpoint: URL,
+        model: String,
+        history: [ChatMessage],
+        systemPrompt: String,
+        userMessage: String,
+        tools: [OllamaTool]? = nil,
+        stream: Bool = false,
+        maxTokens: Int? = nil
+    ) throws -> URLRequest {
+        let payload = OpenAIChatPayload(
+            model: model,
+            messages: buildRequestMessages(
+                history: history,
+                userMessage: userMessage,
+                systemPrompt: systemPrompt
+            ),
+            stream: stream,
+            tools: tools,
+            maxTokens: maxTokens
+        )
+
+        var request = URLRequest(url: resolveOpenAIChatURL(from: endpoint))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(payload)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         return request
     }
 
@@ -357,6 +566,10 @@ public actor OllamaService: AIEngineProtocol {
 
     internal func configSnapshot() -> (endpoint: URL, model: String) {
         (endpoint, model)
+    }
+
+    internal func backendSnapshot() -> AIBackend {
+        backend
     }
 
     private func consumeStream(
@@ -404,6 +617,33 @@ public actor OllamaService: AIEngineProtocol {
         }
 
         return assistantContent
+    }
+
+    private func consumeOpenAIResponse(
+        data: Data,
+        response: URLResponse,
+        continuation: AsyncThrowingStream<String, Error>.Continuation,
+        onToolCall: (@Sendable (PetToolCall) async -> Void)?
+    ) async throws -> String {
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            if let httpResponse = response as? HTTPURLResponse {
+                throw OllamaServiceError.httpStatus(httpResponse.statusCode)
+            }
+            throw OllamaServiceError.invalidResponse
+        }
+
+        let chunk = try Self.parseOpenAIChatResponse(data)
+        if let onToolCall {
+            for call in chunk.toolCalls {
+                await onToolCall(call)
+            }
+        }
+        if let content = chunk.content, !content.isEmpty {
+            continuation.yield(content)
+            return content
+        }
+        return ""
     }
 
     private func recordConversation(userMessage: ChatMessage, assistantMessage: String) {
@@ -485,11 +725,134 @@ public actor OllamaService: AIEngineProtocol {
         return array
     }
 
+    private func resolvedModelName() -> String {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return backend.defaultModel
+        }
+        return trimmed
+    }
+
+    internal nonisolated static func resolveOllamaTagsURL(from endpoint: URL) -> URL {
+        let normalizedPath = endpoint.path.lowercased()
+        if normalizedPath.hasSuffix("/api/tags") {
+            return endpoint
+        }
+        if normalizedPath.hasSuffix("/api/chat") {
+            return endpoint.deletingLastPathComponent().appendingPathComponent("tags")
+        }
+        return endpoint.appendingPathComponent("api").appendingPathComponent("tags")
+    }
+
+    internal nonisolated static func resolveOllamaChatURL(from endpoint: URL) -> URL {
+        let normalizedPath = endpoint.path.lowercased()
+        if normalizedPath.hasSuffix("/api/chat") {
+            return endpoint
+        }
+        if normalizedPath.hasSuffix("/api/tags") {
+            return endpoint.deletingLastPathComponent().appendingPathComponent("chat")
+        }
+        return endpoint.appendingPathComponent("api").appendingPathComponent("chat")
+    }
+
+    internal nonisolated static func resolveOpenAIModelsURL(from endpoint: URL) -> URL {
+        let normalizedPath = Self.trimmedLowercasedPath(endpoint)
+        if normalizedPath.hasSuffix("/v1/models") || normalizedPath.hasSuffix("/models") {
+            return endpoint
+        }
+        if normalizedPath.hasSuffix("/v1/chat/completions") {
+            return endpoint
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("models")
+        }
+        if normalizedPath.hasSuffix("/v1/chat") {
+            return endpoint
+                .deletingLastPathComponent()
+                .appendingPathComponent("models")
+        }
+        if normalizedPath.hasSuffix("/v1") {
+            return endpoint.appendingPathComponent("models")
+        }
+        return endpoint.appendingPathComponent("v1").appendingPathComponent("models")
+    }
+
+    internal nonisolated static func resolveOpenAIChatURL(from endpoint: URL) -> URL {
+        let normalizedPath = Self.trimmedLowercasedPath(endpoint)
+        if normalizedPath.hasSuffix("/v1/chat/completions") || normalizedPath.hasSuffix("/chat/completions") {
+            return endpoint
+        }
+        if normalizedPath.hasSuffix("/v1/chat") || normalizedPath.hasSuffix("/chat") {
+            return endpoint.appendingPathComponent("completions")
+        }
+        if normalizedPath.hasSuffix("/v1") {
+            return endpoint
+                .appendingPathComponent("chat")
+                .appendingPathComponent("completions")
+        }
+        if normalizedPath.hasSuffix("/v1/models") {
+            return endpoint
+                .deletingLastPathComponent()
+                .appendingPathComponent("chat")
+                .appendingPathComponent("completions")
+        }
+        return endpoint
+            .appendingPathComponent("v1")
+            .appendingPathComponent("chat")
+            .appendingPathComponent("completions")
+    }
+
+    private nonisolated static func trimmedLowercasedPath(_ url: URL) -> String {
+        let path = url.path.lowercased()
+        if path.count > 1, path.hasSuffix("/") {
+            return String(path.dropLast())
+        }
+        return path
+    }
+
+    internal nonisolated static func parseOpenAIChatResponse(_ data: Data) throws -> ParsedChunk {
+        let decoder = JSONDecoder()
+        let response = try decoder.decode(OpenAIResponse.self, from: data)
+        guard let choice = response.choices.first else {
+            throw OllamaServiceError.invalidResponse
+        }
+
+        return ParsedChunk(
+            content: choice.message.content,
+            done: true,
+            toolCalls: choice.message.toolCalls?.compactMap { toolCall in
+                guard let arguments = toolCall.function.arguments else {
+                    return nil
+                }
+                return PetToolCall(
+                    functionName: toolCall.function.name,
+                    arguments: arguments
+                )
+            } ?? []
+        )
+    }
+
     private struct ChatPayload: Codable {
         let model: String
         let messages: [PayloadMessage]
         let stream: Bool
         let tools: [OllamaTool]?
+    }
+
+    private struct OpenAIChatPayload: Codable {
+        let model: String
+        let messages: [PayloadMessage]
+        let stream: Bool
+        let tools: [OllamaTool]?
+        let maxTokens: Int?
+
+        private enum CodingKeys: String, CodingKey {
+            case model
+            case messages
+            case stream
+            case tools
+            case maxTokens = "max_tokens"
+        }
     }
 
     internal struct PayloadMessage: Codable {
@@ -541,6 +904,64 @@ public actor OllamaService: AIEngineProtocol {
         private enum CodingKeys: String, CodingKey {
             case message
             case done
+        }
+
+        struct ToolCall: Decodable {
+            let function: ToolCallFunction
+        }
+
+        struct ToolCallFunction: Decodable {
+            let name: String
+            let arguments: [String: String]?
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                name = try container.decode(String.self, forKey: .name)
+                if let dictionary = try? container.decode([String: String].self, forKey: .arguments) {
+                    arguments = dictionary
+                } else if let argumentsString = try? container.decode(String.self, forKey: .arguments) {
+                    arguments = Self.decodeArguments(from: argumentsString)
+                } else {
+                    arguments = nil
+                }
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case name
+                case arguments
+            }
+
+            private static func decodeArguments(from raw: String) -> [String: String]? {
+                guard let data = raw.data(using: .utf8),
+                      let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    return nil
+                }
+                var output: [String: String] = [:]
+                for (key, value) in decoded {
+                    output[key] = String(describing: value)
+                }
+                return output
+            }
+        }
+    }
+
+    private struct OpenAIResponse: Decodable {
+        let choices: [Choice]
+
+        struct Choice: Decodable {
+            let message: Message
+        }
+
+        struct Message: Decodable {
+            let role: String
+            let content: String?
+            let toolCalls: [ToolCall]?
+
+            private enum CodingKeys: String, CodingKey {
+                case role
+                case content
+                case toolCalls = "tool_calls"
+            }
         }
 
         struct ToolCall: Decodable {

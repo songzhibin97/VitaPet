@@ -1,5 +1,6 @@
 import EventBus
 import Foundation
+import AIEngine
 import Localization
 import RenderEngine
 import SwiftUI
@@ -150,8 +151,10 @@ public struct SettingsView: View {
     @State private var pendingResetPetID: UUID?
     @State private var selectedSpritePackID: String
     @State private var ollamaEndpoint: String
+    @State private var aiBackend: AIEngine.AIBackend
     @State private var ollamaModel: String
     @State private var aiSystemPrompt: String
+    @State private var liveAIStatus: AIEngineStatus
     @State private var githubToken: String
     @State private var webhookEnabled: Bool
     @State private var webhookPort: Int
@@ -187,9 +190,9 @@ public struct SettingsView: View {
     private let onRevealInFinder: @MainActor (String) -> Void
     private let onCreateTemplate: @MainActor () async -> String?
     private let loadPetProfiles: @MainActor () -> [PetProfileItem]
-    private let aiStatus: AIEngineStatus
+    private let aiStatusProvider: @MainActor () -> AIEngineStatus
     private let onTestConnection: @MainActor () -> Void
-    private let onSaveAIConfig: @MainActor (String, String, String) -> Void
+    private let onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend) -> Void
     private let onSaveNotificationConfig: @MainActor (String, Bool, Int, String) -> Void
     private let onUpdatePet: @MainActor (UUID, String, String, Double, String, String, String, String) -> Void
     private let onUpdatePetSound: @MainActor (UUID, Bool?, Float?) -> Void
@@ -224,6 +227,7 @@ public struct SettingsView: View {
         onRevealInFinder: @escaping @MainActor (String) -> Void = { _ in },
         onCreateTemplate: @escaping @MainActor () async -> String? = { nil },
         ollamaEndpoint: String = "http://localhost:11434",
+        aiBackend: AIEngine.AIBackend = .ollama,
         ollamaModel: String = "llama3.2",
         aiSystemPrompt: String = "",
         githubToken: String = "",
@@ -231,8 +235,9 @@ public struct SettingsView: View {
         webhookPort: Int = 19280,
         webhookSecret: String = "",
         aiStatus: AIEngineStatus = .notConfigured,
+        aiStatusProvider: @escaping @MainActor () -> AIEngineStatus = { .notConfigured },
         onTestConnection: @escaping @MainActor () -> Void = {},
-        onSaveAIConfig: @escaping @MainActor (String, String, String) -> Void = { _, _, _ in },
+        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend) -> Void = { _, _, _, _ in },
         onSaveNotificationConfig: @escaping @MainActor (String, Bool, Int, String) -> Void = { _, _, _, _ in },
         onUpdatePet: @escaping @MainActor (UUID, String, String, Double, String, String, String, String) -> Void = { _, _, _, _, _, _, _, _ in },
         onUpdatePetSound: @escaping @MainActor (UUID, Bool?, Float?) -> Void = { _, _, _ in },
@@ -269,8 +274,10 @@ public struct SettingsView: View {
         _petProfiles = State(initialValue: petProfiles)
         _selectedSpritePackID = State(initialValue: selectedSpritePackID)
         _ollamaEndpoint = State(initialValue: ollamaEndpoint)
+        _aiBackend = State(initialValue: aiBackend)
         _ollamaModel = State(initialValue: ollamaModel)
         _aiSystemPrompt = State(initialValue: aiSystemPrompt)
+        _liveAIStatus = State(initialValue: aiStatus)
         _githubToken = State(initialValue: githubToken)
         _webhookEnabled = State(initialValue: webhookEnabled)
         _webhookPort = State(initialValue: webhookPort)
@@ -303,7 +310,7 @@ public struct SettingsView: View {
         self.onRevealInFinder = onRevealInFinder
         self.onCreateTemplate = onCreateTemplate
         self.loadPetProfiles = loadPetProfiles
-        self.aiStatus = aiStatus
+        self.aiStatusProvider = aiStatusProvider
         self.onTestConnection = onTestConnection
         self.onSaveAIConfig = onSaveAIConfig
         self.onSaveNotificationConfig = onSaveNotificationConfig
@@ -813,7 +820,7 @@ public struct SettingsView: View {
             Section(L10n.settingsAI) {
                 HStack(alignment: .center, spacing: 12) {
                     Circle()
-                        .fill(statusColor(for: aiStatus))
+                        .fill(statusColor(for: liveAIStatus))
                         .frame(width: 10, height: 10)
 
                     Text(aiStatusText)
@@ -822,16 +829,29 @@ public struct SettingsView: View {
                 }
                 .padding(.bottom, 2)
 
+                Picker(L10n.settingsAIBackend, selection: $aiBackend) {
+                    ForEach(AIEngine.AIBackend.allCases, id: \.self) { backend in
+                        Text(aiBackendTitle(backend)).tag(backend)
+                    }
+                }
+                .onChange(of: aiBackend) { oldValue, newValue in
+                    let trimmedModel = ollamaModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmedModel.isEmpty || trimmedModel == oldValue.defaultModel {
+                        ollamaModel = newValue.defaultModel
+                    }
+                    onSaveAIConfig(ollamaEndpoint, ollamaModel, aiSystemPrompt, newValue)
+                }
+
                 TextField(L10n.settingsAIEndpoint, text: $ollamaEndpoint)
                     .textFieldStyle(.roundedBorder)
                     .onChange(of: ollamaEndpoint) { _, newValue in
-                        onSaveAIConfig(newValue, ollamaModel, aiSystemPrompt)
+                        onSaveAIConfig(newValue, ollamaModel, aiSystemPrompt, aiBackend)
                     }
 
                 TextField(L10n.settingsAIModel, text: $ollamaModel)
                     .textFieldStyle(.roundedBorder)
                     .onChange(of: ollamaModel) { _, newValue in
-                        onSaveAIConfig(ollamaEndpoint, newValue, aiSystemPrompt)
+                        onSaveAIConfig(ollamaEndpoint, newValue, aiSystemPrompt, aiBackend)
                     }
 
                 Text(L10n.settingsAISystemPrompt)
@@ -851,7 +871,7 @@ public struct SettingsView: View {
                         .font(.body)
                         .frame(minHeight: 96)
                         .onChange(of: aiSystemPrompt) { _, newValue in
-                            onSaveAIConfig(ollamaEndpoint, ollamaModel, newValue)
+                            onSaveAIConfig(ollamaEndpoint, ollamaModel, newValue, aiBackend)
                         }
                         .overlay(
                             RoundedRectangle(cornerRadius: 8)
@@ -860,7 +880,20 @@ public struct SettingsView: View {
                 }
 
                 Button(L10n.settingsAITestConnection) {
+                    liveAIStatus = .connecting
                     onTestConnection()
+
+                    Task { @MainActor in
+                        for _ in 0..<60 {
+                            try? await Task.sleep(for: .seconds(1))
+                            let status = aiStatusProvider()
+                            liveAIStatus = status
+                            if case .connecting = status {
+                                continue
+                            }
+                            break
+                        }
+                    }
                 }
             }
 
@@ -1096,6 +1129,9 @@ public struct SettingsView: View {
         } message: {
             Text("卸载后将删除该插件目录，且无法恢复。")
         }
+        .onAppear {
+            liveAIStatus = aiStatusProvider()
+        }
         .task {
             await pluginSettingsViewModel.refresh()
         }
@@ -1167,15 +1203,27 @@ public struct SettingsView: View {
     }
 
     private var aiStatusText: String {
-        switch aiStatus {
+        switch liveAIStatus {
         case .ready:
             return L10n.settingsAIStatusReady
         case .notConfigured:
             return L10n.settingsAIStatusNotConfigured
         case .connecting:
             return L10n.settingsAIStatusConnecting
-        case .error:
-            return L10n.settingsAIStatusError
+        case .error(let message):
+            if message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return L10n.settingsAIStatusError
+            }
+            return "\(L10n.settingsAIStatusError): \(message)"
+        }
+    }
+
+    private func aiBackendTitle(_ backend: AIEngine.AIBackend) -> String {
+        switch backend {
+        case .ollama:
+            return L10n.settingsAIBackendOllama
+        case .openAICompatible:
+            return L10n.settingsAIBackendOpenAICompatible
         }
     }
 

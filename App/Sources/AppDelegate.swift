@@ -94,10 +94,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let configManager = ConfigManager()
         let databaseManager = DatabaseManager()
         L10n.locale = configManager.config.locale
-        let initialEndpoint = URL(string: configManager.config.ollamaEndpoint) ?? URL(string: "http://localhost:11434")!
+        let initialEndpointValue = Self.normalizedAIEndpoint(configManager.config.ollamaEndpoint)
+        let initialBackend = Self.inferredAIBackend(
+            preferred: Self.resolvedAIBackend(from: configManager.config.aiBackend),
+            endpointValue: initialEndpointValue
+        )
+        let initialModel = Self.normalizedAIModel(configManager.config.ollamaModel, backend: initialBackend)
+        let initialEndpoint = URL(string: initialEndpointValue) ?? URL(string: "http://localhost:11434")!
         let ollamaService = OllamaService(
             endpoint: initialEndpoint,
-            model: configManager.config.ollamaModel
+            model: initialModel,
+            backend: initialBackend
         )
         self.ollamaService = ollamaService
         await ollamaService.updateSystemPrompt(configManager.config.aiSystemPrompt)
@@ -167,22 +174,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
-        let onSaveAIConfig: @MainActor (String, String, String) -> Void = { [weak self, weak configManager] endpoint, model, aiSystemPrompt in
+        let onSaveAIConfig: @MainActor (String, String, String, AIBackend) -> Void = { [weak self, weak configManager] endpoint, model, aiSystemPrompt, backend in
             guard let self,
                   let configManager else {
                 return
             }
 
-            let trimmedEndpoint = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-            let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedPrompt = aiSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            let resolvedEndpointValue = trimmedEndpoint.isEmpty ? "http://localhost:11434" : trimmedEndpoint
-            let resolvedModel = trimmedModel.isEmpty ? "llama3.2" : trimmedModel
+            let resolvedEndpointValue = Self.normalizedAIEndpoint(endpoint)
+            let currentBackend = Self.inferredAIBackend(
+                preferred: Self.resolvedAIBackend(from: configManager.config.aiBackend),
+                endpointValue: configManager.config.ollamaEndpoint
+            )
+            let effectiveBackend = Self.inferredAIBackend(preferred: backend, endpointValue: resolvedEndpointValue)
+            let resolvedModel = Self.normalizedAIModel(
+                model,
+                backend: effectiveBackend,
+                previousBackend: currentBackend
+            )
             let resolvedEndpoint = URL(string: resolvedEndpointValue) ?? URL(string: "http://localhost:11434")!
 
             do {
                 try configManager.update {
                     $0.ollamaEndpoint = resolvedEndpointValue
+                    $0.aiBackend = effectiveBackend.rawValue
                     $0.ollamaModel = resolvedModel
                     $0.aiSystemPrompt = trimmedPrompt
                 }
@@ -191,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             Task {
-                await ollamaService.updateConfig(endpoint: resolvedEndpoint, model: resolvedModel)
+                await ollamaService.updateConfig(endpoint: resolvedEndpoint, model: resolvedModel, backend: effectiveBackend)
                 await ollamaService.updateSystemPrompt(trimmedPrompt)
                 await ollamaService.checkConnection()
                 self.aiStatus = await ollamaService.status
@@ -468,6 +483,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         chatController.configureAISettings(
             aiEndpoint: { [weak configManager] in
                 configManager?.config.ollamaEndpoint ?? "http://localhost:11434"
+            },
+            aiBackend: { [weak configManager] in
+                let endpoint = configManager?.config.ollamaEndpoint ?? ""
+                let preferred = Self.resolvedAIBackend(from: configManager?.config.aiBackend ?? "ollama")
+                return Self.inferredAIBackend(preferred: preferred, endpointValue: endpoint)
             },
             aiModel: { [weak configManager] in
                 configManager?.config.ollamaModel ?? "llama3.2"
@@ -2418,4 +2438,47 @@ private extension JSONEncoder {
 private func requestAccessibilityPermission() {
     let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
     AXIsProcessTrustedWithOptions(options)
+}
+
+private extension AppDelegate {
+    static func resolvedAIBackend(from rawValue: String) -> AIBackend {
+        AIBackend(rawValue: rawValue) ?? .ollama
+    }
+
+    static func inferredAIBackend(preferred: AIBackend, endpointValue: String) -> AIBackend {
+        let lowercased = endpointValue.lowercased()
+        if lowercased.contains("/v1/chat/completions") || lowercased.contains("/v1/models") {
+            return .openAICompatible
+        }
+        if lowercased.contains("/api/chat") || lowercased.contains("/api/tags") {
+            return .ollama
+        }
+        return preferred
+    }
+
+    static func normalizedAIEndpoint(_ rawValue: String, fallback: String = "http://localhost:11434") -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return fallback
+        }
+
+        if trimmed.contains("://") {
+            return trimmed
+        }
+
+        return "http://\(trimmed)"
+    }
+
+    static func normalizedAIModel(_ rawValue: String, backend: AIBackend, previousBackend: AIBackend? = nil) -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return backend.defaultModel
+        }
+
+        if let previousBackend, previousBackend != backend, trimmed == previousBackend.defaultModel {
+            return backend.defaultModel
+        }
+
+        return trimmed
+    }
 }

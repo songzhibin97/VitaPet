@@ -12,6 +12,7 @@ public final class ConfigManager {
         public var disabledPlugins: [String]
         public var locale: String
         public var ollamaEndpoint: String
+        public var aiBackend: String
         public var ollamaModel: String
         public var aiSystemPrompt: String
         public var aiProactiveEnabled: Bool
@@ -32,6 +33,7 @@ public final class ConfigManager {
             disabledPlugins: [String] = [],
             locale: String,
             ollamaEndpoint: String = "http://localhost:11434",
+            aiBackend: String = "ollama",
             ollamaModel: String = "llama3.2",
             aiSystemPrompt: String = "",
             aiProactiveEnabled: Bool = true,
@@ -60,6 +62,7 @@ public final class ConfigManager {
             self.disabledPlugins = disabledPlugins
             self.locale = locale
             self.ollamaEndpoint = ollamaEndpoint
+            self.aiBackend = aiBackend
             self.ollamaModel = ollamaModel
             self.aiSystemPrompt = aiSystemPrompt
             self.aiProactiveEnabled = aiProactiveEnabled
@@ -81,6 +84,7 @@ public final class ConfigManager {
             case disabledPlugins
             case locale
             case ollamaEndpoint
+            case aiBackend
             case ollamaModel
             case aiSystemPrompt
             case aiProactiveEnabled
@@ -117,6 +121,7 @@ public final class ConfigManager {
             disabledPlugins = try container.decodeIfPresent([String].self, forKey: .disabledPlugins) ?? []
             locale = try container.decodeIfPresent(String.self, forKey: .locale) ?? ConfigManager.defaultLocaleIdentifier()
             ollamaEndpoint = try container.decodeIfPresent(String.self, forKey: .ollamaEndpoint) ?? "http://localhost:11434"
+            aiBackend = try container.decodeIfPresent(String.self, forKey: .aiBackend) ?? "ollama"
             ollamaModel = try container.decodeIfPresent(String.self, forKey: .ollamaModel) ?? "llama3.2"
             aiSystemPrompt = try container.decodeIfPresent(String.self, forKey: .aiSystemPrompt) ?? ""
             aiProactiveEnabled = try container.decodeIfPresent(Bool.self, forKey: .aiProactiveEnabled) ?? true
