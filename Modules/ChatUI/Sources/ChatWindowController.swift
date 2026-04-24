@@ -27,8 +27,19 @@ public final class ChatWindowController: NSWindowController {
     private var aiModel: @MainActor () -> String = { "llama3.2" }
     private var aiStatus: @MainActor () -> AIEngineStatus = { .notConfigured }
     private var aiSystemPrompt: @MainActor () -> String = { "" }
+    private var memoryWorkerEnabled: @MainActor () -> Bool = { false }
+    private var memoryWorkerEndpoint: @MainActor () -> String = { "https://memory.example.com" }
+    private var memoryWorkerAuthMode: @MainActor () -> String = { "basic" }
+    private var memoryWorkerUsername: @MainActor () -> String = { "" }
+    private var memoryWorkerSecret: @MainActor () -> String = { "" }
+    private var memoryWorkerScope: @MainActor () -> String = { "user" }
+    private var memoryWorkerSubject: @MainActor () -> String = { "demo-user" }
+    private var memoryWorkerQueryLimit: @MainActor () -> Int = { 5 }
     private var onTestConnection: @MainActor () -> Void = {}
+    private var onTestAIMemoryConnection: @MainActor () async -> String? = { nil }
+    private var onTestAIMemoryWrite: @MainActor () async -> String? = { nil }
     private var onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend) -> Void = { _, _, _, _ in }
+    private var onSaveAIMemoryConfig: @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = { _, _, _, _, _, _, _, _ in }
     private var githubToken: @MainActor () -> String = { "" }
     private var webhookEnabled: @MainActor () -> Bool = { false }
     private var webhookPort: @MainActor () -> Int = { 19280 }
@@ -117,6 +128,13 @@ public final class ChatWindowController: NSWindowController {
 
     public func showChat() {
         window?.title = "VitaPet Chat"
+        // Keep the title bar opaque so SwiftUI's NavigationSplitView doesn't render its toolbar
+        // region on top of the scrollable chat content (otherwise messages appear to bleed into
+        // the titlebar area when scrolling).
+        window?.titlebarAppearsTransparent = false
+        window?.titleVisibility = .visible
+        window?.styleMask.remove(.fullSizeContentView)
+
         window?.contentView = NSHostingView(
             rootView: TabbedChatView(viewModel: chatViewModel, availablePets: listAvailablePets())
         )
@@ -124,8 +142,12 @@ public final class ChatWindowController: NSWindowController {
             window.setContentSize(NSSize(width: 700, height: 520))
             window.center()
         }
+        // Float above other apps so chat stays visible when switching workspace.
+        window?.level = .floating
+        window?.collectionBehavior.insert(.canJoinAllSpaces)
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     public func showSettings() {
@@ -147,6 +169,14 @@ public final class ChatWindowController: NSWindowController {
                 aiBackend: aiBackend(),
                 ollamaModel: aiModel(),
                 aiSystemPrompt: aiSystemPrompt(),
+                memoryWorkerEnabled: memoryWorkerEnabled(),
+                memoryWorkerEndpoint: memoryWorkerEndpoint(),
+                memoryWorkerAuthMode: memoryWorkerAuthMode(),
+                memoryWorkerUsername: memoryWorkerUsername(),
+                memoryWorkerSecret: memoryWorkerSecret(),
+                memoryWorkerScope: memoryWorkerScope(),
+                memoryWorkerSubject: memoryWorkerSubject(),
+                memoryWorkerQueryLimit: memoryWorkerQueryLimit(),
                 githubToken: githubToken(),
                 webhookEnabled: webhookEnabled(),
                 webhookPort: webhookPort(),
@@ -154,7 +184,10 @@ public final class ChatWindowController: NSWindowController {
                 aiStatus: aiStatus(),
                 aiStatusProvider: aiStatus,
                 onTestConnection: onTestConnection,
+                onTestAIMemoryConnection: onTestAIMemoryConnection,
+                onTestAIMemoryWrite: onTestAIMemoryWrite,
                 onSaveAIConfig: onSaveAIConfig,
+                onSaveAIMemoryConfig: onSaveAIMemoryConfig,
                 onSaveNotificationConfig: onSaveNotificationConfig,
                 onUpdatePet: onUpdatePet,
                 onUpdatePetSound: onUpdatePetSound,
@@ -280,17 +313,39 @@ public final class ChatWindowController: NSWindowController {
         aiBackend: @escaping @MainActor () -> AIEngine.AIBackend,
         aiModel: @escaping @MainActor () -> String,
         aiSystemPrompt: @escaping @MainActor () -> String,
+        memoryWorkerEnabled: @escaping @MainActor () -> Bool = { false },
+        memoryWorkerEndpoint: @escaping @MainActor () -> String = { "https://memory.example.com" },
+        memoryWorkerAuthMode: @escaping @MainActor () -> String = { "basic" },
+        memoryWorkerUsername: @escaping @MainActor () -> String = { "" },
+        memoryWorkerSecret: @escaping @MainActor () -> String = { "" },
+        memoryWorkerScope: @escaping @MainActor () -> String = { "user" },
+        memoryWorkerSubject: @escaping @MainActor () -> String = { "demo-user" },
+        memoryWorkerQueryLimit: @escaping @MainActor () -> Int = { 5 },
         aiStatus: @escaping @MainActor () -> AIEngineStatus,
         onTestConnection: @escaping @MainActor () -> Void = {},
-        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend) -> Void = { _, _, _, _ in }
+        onTestAIMemoryConnection: @escaping @MainActor () async -> String? = { nil },
+        onTestAIMemoryWrite: @escaping @MainActor () async -> String? = { nil },
+        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend) -> Void = { _, _, _, _ in },
+        onSaveAIMemoryConfig: @escaping @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = { _, _, _, _, _, _, _, _ in }
     ) {
         self.aiEndpoint = aiEndpoint
         self.aiBackend = aiBackend
         self.aiModel = aiModel
         self.aiSystemPrompt = aiSystemPrompt
+        self.memoryWorkerEnabled = memoryWorkerEnabled
+        self.memoryWorkerEndpoint = memoryWorkerEndpoint
+        self.memoryWorkerAuthMode = memoryWorkerAuthMode
+        self.memoryWorkerUsername = memoryWorkerUsername
+        self.memoryWorkerSecret = memoryWorkerSecret
+        self.memoryWorkerScope = memoryWorkerScope
+        self.memoryWorkerSubject = memoryWorkerSubject
+        self.memoryWorkerQueryLimit = memoryWorkerQueryLimit
         self.aiStatus = aiStatus
         self.onTestConnection = onTestConnection
+        self.onTestAIMemoryConnection = onTestAIMemoryConnection
+        self.onTestAIMemoryWrite = onTestAIMemoryWrite
         self.onSaveAIConfig = onSaveAIConfig
+        self.onSaveAIMemoryConfig = onSaveAIMemoryConfig
     }
 
     public func configureNotificationSettings(

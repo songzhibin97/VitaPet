@@ -1,12 +1,152 @@
 import Foundation
 import Localization
 
+public enum MemoryCategory: String, Sendable, CaseIterable, Codable {
+    case fact
+    case preference
+    case event
+    case todo
+    case relationship
+
+    public var displayName: String {
+        switch self {
+        case .fact: return "事实"
+        case .preference: return "偏好"
+        case .event: return "事件"
+        case .todo: return "待办"
+        case .relationship: return "关系"
+        }
+    }
+
+    public static func from(rawValue: String?) -> MemoryCategory {
+        guard let raw = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              let category = MemoryCategory(rawValue: raw) else {
+            return .fact
+        }
+        return category
+    }
+}
+
+public struct ExtractedMemory: Sendable, Equatable {
+    public let content: String
+    public let category: MemoryCategory
+    public let importance: Int
+
+    public init(content: String, category: MemoryCategory, importance: Int) {
+        self.content = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.category = category
+        self.importance = max(1, min(3, importance))
+    }
+
+    init?(fromDict dict: [String: Any]) {
+        guard let rawContent = dict["content"] as? String else { return nil }
+        let trimmed = rawContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let category = MemoryCategory.from(rawValue: dict["category"] as? String)
+        let importance: Int
+        if let int = dict["importance"] as? Int {
+            importance = int
+        } else if let double = dict["importance"] as? Double {
+            importance = Int(double)
+        } else if let string = dict["importance"] as? String, let parsed = Int(string) {
+            importance = parsed
+        } else {
+            importance = 1
+        }
+
+        self.init(content: trimmed, category: category, importance: importance)
+    }
+}
+
+public struct MemoryContextItem: Sendable, Equatable {
+    public let content: String
+    public let category: MemoryCategory
+    public let importance: Int
+
+    public init(content: String, category: MemoryCategory, importance: Int) {
+        self.content = content
+        self.category = category
+        self.importance = importance
+    }
+}
+
+/// Strips reasoning/thinking content emitted by chain-of-thought models
+/// (DeepSeek-R1, QwQ, etc.) before it reaches the UI or persisted history.
+///
+/// Handles three patterns:
+/// 1. Well-formed: `<think>...</think>实际回复` — block removed.
+/// 2. Tagless leak: `推理过程...</think>实际回复` — model forgot the opener
+///    but emitted a closer; treat everything before the last close tag as
+///    reasoning and drop it.
+/// 3. Unclosed: `<think>...` (close never arrived) — drop the trailing block.
+public enum ThinkingStripper {
+    private static let openTags = ["<think>", "<thinking>", "<reasoning>", "<reflection>"]
+    private static let closeTags = ["</think>", "</thinking>", "</reasoning>", "</reflection>"]
+
+    public static func strip(_ text: String) -> String {
+        split(text).reply
+    }
+
+    /// Separate reasoning from reply. Handles well-formed `<think>...</think>`,
+    /// tagless leak (close tag with no opener), and unclosed open tag.
+    public static func split(_ text: String) -> (thinking: String?, reply: String) {
+        guard !text.isEmpty else { return (nil, text) }
+        var thinkingChunks: [String] = []
+        var result = text
+
+        for (open, close) in zip(openTags, closeTags) {
+            while let openRange = result.range(of: open, options: .caseInsensitive) {
+                let searchRange = openRange.upperBound..<result.endIndex
+                guard let closeRange = result.range(of: close, options: .caseInsensitive, range: searchRange) else {
+                    break
+                }
+                let inner = String(result[openRange.upperBound..<closeRange.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !inner.isEmpty { thinkingChunks.append(inner) }
+                result.removeSubrange(openRange.lowerBound..<closeRange.upperBound)
+            }
+        }
+
+        for close in closeTags {
+            if let range = result.range(of: close, options: [.caseInsensitive, .backwards]) {
+                let leak = String(result[result.startIndex..<range.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !leak.isEmpty { thinkingChunks.insert(leak, at: 0) }
+                result.removeSubrange(result.startIndex..<range.upperBound)
+            }
+        }
+
+        for open in openTags {
+            if let range = result.range(of: open, options: .caseInsensitive) {
+                let trailing = String(result[range.upperBound..<result.endIndex])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trailing.isEmpty { thinkingChunks.append(trailing) }
+                result.removeSubrange(range.lowerBound..<result.endIndex)
+            }
+        }
+
+        let reply = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        let thinking = thinkingChunks.isEmpty ? nil : thinkingChunks.joined(separator: "\n\n")
+        return (thinking, reply)
+    }
+
+    /// Canonical form for UI: `<think>...</think>{reply}` so MessageBubble can
+    /// render reasoning in a disclosure. Returns just the reply if no thinking.
+    public static func combine(_ text: String) -> String {
+        let parts = split(text)
+        guard let thinking = parts.thinking, !thinking.isEmpty else { return parts.reply }
+        return "<think>\n\(thinking)\n</think>\n\(parts.reply)"
+    }
+}
+
 public actor OllamaService: AIEngineProtocol {
-    private static let baseSystemPrompt = "你是主人桌面上的可爱宠物。回复要简短可爱（1-2句话）。称呼用户为主人。"
+    private static let baseSystemPrompt = "你是主人桌面上的可爱宠物。回复要简短可爱（1-2句话）。称呼用户为主人。直接给出回复，不要展示推理过程；如确需思考，请放在 <think>...</think> 标签内。"
     private var customSystemPrompt = ""
     private var petProfile: String = ""
     private var availableActions: [String] = []
     private var memories: [String] = []
+    private var structuredMemories: [MemoryContextItem] = []
     private var currentSessionId: String = "default"
     private var sessionHistories: [String: [ChatMessage]] = [:]
 
@@ -26,11 +166,42 @@ public actor OllamaService: AIEngineProtocol {
             prompt += "\n你可以在回复中用 [ACTION:动作名] 标签来做动作。可用动作：\(actionList)。"
             prompt += "\n每次回复最多用一个动作标签。示例：好开心！[ACTION:celebrate]"
         }
-        if !memories.isEmpty {
+        let structuredBlock = buildStructuredMemoryBlock()
+        if !structuredBlock.isEmpty {
+            prompt += "\n\n" + structuredBlock
+        } else if !memories.isEmpty {
             let memoryList = memories.map { "- \($0)" }.joined(separator: "\n")
             prompt += "\n\n你记住了以下关于用户的信息：\n\(memoryList)"
         }
         return prompt
+    }
+
+    private func buildStructuredMemoryBlock() -> String {
+        guard !structuredMemories.isEmpty else { return "" }
+
+        let sorted = structuredMemories.sorted { lhs, rhs in
+            if lhs.importance != rhs.importance { return lhs.importance > rhs.importance }
+            return lhs.category.rawValue < rhs.category.rawValue
+        }
+
+        var grouped: [MemoryCategory: [MemoryContextItem]] = [:]
+        for item in sorted {
+            grouped[item.category, default: []].append(item)
+        }
+
+        let order: [MemoryCategory] = [.fact, .relationship, .preference, .todo, .event]
+        var sections: [String] = []
+        for category in order {
+            guard let items = grouped[category], !items.isEmpty else { continue }
+            let bullets = items.map { item -> String in
+                let marker = item.importance >= 3 ? "⭐ " : "- "
+                return marker + item.content
+            }.joined(separator: "\n")
+            sections.append("[\(category.displayName)]\n\(bullets)")
+        }
+
+        guard !sections.isEmpty else { return "" }
+        return "关于主人的已知信息（请在合适的时候自然地运用，不要生硬地重复）：\n" + sections.joined(separator: "\n\n")
     }
 
     private var endpoint: URL
@@ -363,6 +534,12 @@ public actor OllamaService: AIEngineProtocol {
 
     public func updateMemories(_ newMemories: [String]) {
         memories = newMemories
+        structuredMemories = []
+    }
+
+    public func updateStructuredMemories(_ items: [MemoryContextItem]) {
+        structuredMemories = items
+        memories = items.map(\.content)
     }
 
     public func generateProactive(context: String) async throws -> String {
@@ -394,7 +571,7 @@ public actor OllamaService: AIEngineProtocol {
                 throw OllamaServiceError.invalidResponse
             }
 
-            return content.trimmingCharacters(in: .whitespacesAndNewlines)
+            return ThinkingStripper.strip(content)
         case .openAICompatible:
             let request = try Self.buildOpenAICompatibleChatRequest(
                 endpoint: endpoint,
@@ -416,20 +593,48 @@ public actor OllamaService: AIEngineProtocol {
                 throw OllamaServiceError.invalidResponse
             }
 
-            return content.trimmingCharacters(in: .whitespacesAndNewlines)
+            return ThinkingStripper.strip(content)
         }
     }
 
     public func extractMemories(from recentMessages: [(role: String, content: String)]) async throws -> [String] {
+        let structured = try await extractStructuredMemories(from: recentMessages)
+        return structured.map(\.content)
+    }
+
+    public func extractStructuredMemories(
+        from recentMessages: [(role: String, content: String)]
+    ) async throws -> [ExtractedMemory] {
         let extractionPrompt = """
-        从以下对话中提取用户的关键信息（偏好、习惯、事实、名字等），每条信息用一个简短的中文句子。
-        只返回 JSON 数组格式，例如：["用户喜欢猫", "用户是程序员"]
-        如果没有新信息，返回空数组 []
+        你是一个记忆提取助手。从以下对话中提取对用户有长期价值的信息。
+
+        只提取：
+        - fact：客观事实（姓名、生日、工作、家庭成员、地点、设备等）
+        - preference：主观偏好（喜欢 / 不喜欢、口味、风格等）
+        - event：已发生的具体事件（有时间点或场景）
+        - todo：用户明确提到的待办或承诺（"我下周要去..."）
+        - relationship：与他人的关系或联系方式
+
+        不要提取：寒暄、临时话题、情绪波动、宠物自己的动作/心情、AI 的回答本身。
+
+        每条记忆写成一句自成独立上下文的中文陈述（不要"他"/"她"之类指代，需补全主语），并评估重要性：
+        - 1：一般（偶然提到的偏好）
+        - 2：重要（生日、工作、家人）
+        - 3：关键（用户明确说"请记住..."）
+
+        若对话里有多条互不重复的长期信息，请拆成多条记忆分别输出，不要合并成一条笼统摘要；只要符合条件，通常可提取 2～8 条（视对话信息量而定）。
+
+        严格返回 JSON 数组，每项结构：
+        {"content": "用户生日是 6 月 3 日", "category": "fact", "importance": 2}
+
+        没有可提取的信息时返回空数组 []。不要解释、不要 Markdown 代码块，只输出 JSON。
         """
 
         let conversationText = recentMessages
             .map { "\($0.role): \($0.content)" }
             .joined(separator: "\n")
+
+        let responseText: String?
         switch backend {
         case .ollama:
             let request = try Self.buildChatRequest(
@@ -440,19 +645,11 @@ public actor OllamaService: AIEngineProtocol {
                 userMessage: conversationText,
                 stream: false
             )
-
-            let (responseData, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse,
-                  (200...299).contains(httpResponse.statusCode) else {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                 return []
             }
-
-            let parsed = try? JSONDecoder().decode(NonStreamResponse.self, from: responseData)
-            guard let content = parsed?.message?.content else {
-                return []
-            }
-
-            return Self.parseMemoryArray(from: content)
+            responseText = (try? JSONDecoder().decode(NonStreamResponse.self, from: data))?.message?.content
         case .openAICompatible:
             let request = try Self.buildOpenAICompatibleChatRequest(
                 endpoint: endpoint,
@@ -462,20 +659,16 @@ public actor OllamaService: AIEngineProtocol {
                 userMessage: conversationText,
                 stream: false
             )
-
-            let (responseData, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse,
-                  (200...299).contains(httpResponse.statusCode) else {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                 return []
             }
-
-            let parsed = try? Self.parseOpenAIChatResponse(responseData)
-            guard let content = parsed?.content else {
-                return []
-            }
-
-            return Self.parseMemoryArray(from: content)
+            responseText = try? Self.parseOpenAIChatResponse(data).content
         }
+
+        guard let responseText else { return [] }
+        let cleanedText = ThinkingStripper.strip(responseText)
+        return Self.parseStructuredMemories(from: cleanedText)
     }
 
     internal static func buildChatRequest(
@@ -586,7 +779,7 @@ public actor OllamaService: AIEngineProtocol {
             throw OllamaServiceError.invalidResponse
         }
 
-        var assistantContent = ""
+        var rawContent = ""
         var finished = false
 
         for try await line in bytes.lines {
@@ -602,7 +795,10 @@ public actor OllamaService: AIEngineProtocol {
                 }
             }
             if let content = chunk.content, !content.isEmpty {
-                assistantContent += content
+                rawContent += content
+                // Yield raw token incrementally so the bubble can render the
+                // reasoning live. MessageBubble's parser handles partial states
+                // (open `<think>` without a close yet) and tagless leaks.
                 continuation.yield(content)
             }
 
@@ -616,7 +812,11 @@ public actor OllamaService: AIEngineProtocol {
             throw OllamaServiceError.incompleteStream
         }
 
-        return assistantContent
+        // Return the canonical `<think>...</think>{reply}` form for history /
+        // DB persistence so reloads parse cleanly even if the live stream had
+        // a tagless leak. The live bubble keeps the raw token stream — both
+        // forms parse to the same (thinking, reply) tuple.
+        return ThinkingStripper.combine(rawContent)
     }
 
     private func consumeOpenAIResponse(
@@ -640,8 +840,11 @@ public actor OllamaService: AIEngineProtocol {
             }
         }
         if let content = chunk.content, !content.isEmpty {
-            continuation.yield(content)
-            return content
+            let combined = ThinkingStripper.combine(content)
+            if !combined.isEmpty {
+                continuation.yield(combined)
+            }
+            return combined
         }
         return ""
     }
@@ -700,7 +903,13 @@ public actor OllamaService: AIEngineProtocol {
         messages.append(PayloadMessage(role: ChatMessage.Role.system.rawValue, content: systemPrompt))
 
         let mappedHistory = history.map { message in
-            PayloadMessage(role: message.role.rawValue, content: message.content)
+            // Strip <think>...</think> from prior assistant turns so the model
+            // doesn't see (and try to imitate or get confused by) its own
+            // earlier reasoning. UI keeps the tagged version for display.
+            let content = message.role == .assistant
+                ? ThinkingStripper.strip(message.content)
+                : message.content
+            return PayloadMessage(role: message.role.rawValue, content: content)
         }
         messages.append(contentsOf: mappedHistory)
         messages.append(PayloadMessage(role: ChatMessage.Role.user.rawValue, content: userMessage))
@@ -723,6 +932,38 @@ public actor OllamaService: AIEngineProtocol {
             return []
         }
         return array
+    }
+
+    static func parseStructuredMemories(from text: String) -> [ExtractedMemory] {
+        guard let jsonText = extractFirstJSONArray(from: text),
+              let data = jsonText.data(using: .utf8) else {
+            return []
+        }
+
+        // Primary path: objects with fields.
+        if let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            return raw.compactMap { ExtractedMemory(fromDict: $0) }
+        }
+
+        // Fallback: plain string array — upgrade with default category/importance so older prompts keep working.
+        if let strings = try? JSONSerialization.jsonObject(with: data) as? [String] {
+            return strings
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .map { ExtractedMemory(content: $0, category: .fact, importance: 1) }
+        }
+
+        return []
+    }
+
+    private static func extractFirstJSONArray(from text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("[") { return trimmed }
+        guard let start = trimmed.firstIndex(of: "["),
+              let end = trimmed.lastIndex(of: "]"), start < end else {
+            return nil
+        }
+        return String(trimmed[start...end])
     }
 
     private func resolvedModelName() -> String {

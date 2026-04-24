@@ -384,6 +384,30 @@ final class DatabaseManagerTests: XCTestCase {
         XCTAssertEqual(memories[0].category, "auto")
     }
 
+    func testFetchUnsyncedMemoryRecords_excludesSyncedRows() async throws {
+        try await manager.initialize()
+
+        let id1 = try await manager.insertMemory(
+            content: "本地条目一",
+            category: "fact",
+            contentHash: "unsynced-test-hash-1"
+        )
+        _ = try await manager.insertMemory(
+            content: "本地条目二",
+            category: "preference",
+            contentHash: "unsynced-test-hash-2"
+        )
+
+        let before = try await manager.fetchUnsyncedMemoryRecords(limit: 20)
+        XCTAssertEqual(before.count, 2)
+
+        try await manager.markMemorySynced(id: id1, remoteId: "remote-1")
+
+        let after = try await manager.fetchUnsyncedMemoryRecords(limit: 20)
+        XCTAssertEqual(after.count, 1)
+        XCTAssertEqual(after[0].content, "本地条目二")
+    }
+
     func testDeleteMemory_removesSpecifiedRow() async throws {
         try await manager.initialize()
 

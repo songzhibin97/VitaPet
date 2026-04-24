@@ -210,6 +210,68 @@ final class OllamaServiceTests: XCTestCase {
         XCTAssertTrue(chunk.done)
     }
 
+    func testThinkingStripper_removesWellFormedBlock() {
+        let input = "<think>主人想知道我有什么记忆，让我组织一下回答</think>小喵记得主人喜欢数数～"
+        XCTAssertEqual(ThinkingStripper.strip(input), "小喵记得主人喜欢数数～")
+    }
+
+    func testThinkingStripper_handlesTaglessLeak() {
+        // DeepSeek-R1 / QwQ sometimes emit reasoning without an opener,
+        // closed only by a stray </think> before the real reply.
+        let input = """
+        Here's a thinking process:
+        1. Analyze user input...
+        2. Draft response...
+        Output Generation.
+        </think>
+
+        小喵牢牢记得主人喜欢数数～[ACTION:lookAtCursor]
+        """
+        XCTAssertEqual(
+            ThinkingStripper.strip(input),
+            "小喵牢牢记得主人喜欢数数～[ACTION:lookAtCursor]"
+        )
+    }
+
+    func testThinkingStripper_dropsUnclosedTrailingThink() {
+        let input = "你好主人～<think>但其实我还在想"
+        XCTAssertEqual(ThinkingStripper.strip(input), "你好主人～")
+    }
+
+    func testThinkingStripper_passesThroughCleanContent() {
+        let input = "好开心！[ACTION:celebrate]"
+        XCTAssertEqual(ThinkingStripper.strip(input), "好开心！[ACTION:celebrate]")
+    }
+
+    func testThinkingStripper_stripsMultipleBlocks() {
+        let input = "<think>第一段思考</think>开头<thinking>中间又想了想</thinking>结尾"
+        XCTAssertEqual(ThinkingStripper.strip(input), "开头结尾")
+    }
+
+    func testThinkingStripper_splitReturnsBothParts() {
+        let input = "<think>主人在问记忆</think>小喵记得呀～"
+        let parts = ThinkingStripper.split(input)
+        XCTAssertEqual(parts.thinking, "主人在问记忆")
+        XCTAssertEqual(parts.reply, "小喵记得呀～")
+    }
+
+    func testThinkingStripper_splitCapturesTaglessLeak() {
+        let input = "Here's a thinking process:\nstep 1\nstep 2\n</think>\n\n小喵记得！"
+        let parts = ThinkingStripper.split(input)
+        XCTAssertEqual(parts.thinking, "Here's a thinking process:\nstep 1\nstep 2")
+        XCTAssertEqual(parts.reply, "小喵记得！")
+    }
+
+    func testThinkingStripper_combineProducesCanonicalForm() {
+        let input = "Reasoning text...\n</think>\n实际回复"
+        let combined = ThinkingStripper.combine(input)
+        XCTAssertEqual(combined, "<think>\nReasoning text...\n</think>\n实际回复")
+    }
+
+    func testThinkingStripper_combinePassesThroughCleanReply() {
+        XCTAssertEqual(ThinkingStripper.combine("好开心！"), "好开心！")
+    }
+
     func testClearHistory() async {
         let service = OllamaService(
             endpoint: URL(string: "http://localhost:11434")!,

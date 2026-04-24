@@ -33,6 +33,9 @@ public final class ChatViewModel {
     public var onConversationChanged: ((String) -> Void)?
     public var onCreateGroup: ((String, [UUID]) -> Void)?
     public var onDeleteConversation: (@MainActor (String) -> Void)?
+    /// Called when the user enters a `/command arguments` style message in the chat input.
+    /// Return true to consume the message (it won't be forwarded to the AI).
+    public var onSlashCommand: (@MainActor (_ name: String, _ arguments: String) async -> Bool)?
 
     public init(
         sendToAI: @escaping @Sendable (String, [ChatMessage]) async throws -> AsyncThrowingStream<String, Error> = { _, _ in
@@ -57,6 +60,14 @@ public final class ChatViewModel {
         }
         ensureSelectedConversation()
         inputText = ""
+
+        if let command = Self.parseSlashCommand(from: trimmedInput), let handler = onSlashCommand {
+            appendToCurrentConversation(ChatMessage(role: .user, content: trimmedInput))
+            Task { @MainActor in
+                _ = await handler(command.name, command.arguments)
+            }
+            return
+        }
 
         let userMessage = ChatMessage(role: .user, content: trimmedInput)
         appendToCurrentConversation(userMessage)
@@ -240,29 +251,40 @@ public final class ChatViewModel {
         guard let id = selectedConversationId else {
             return
         }
-        messagesByConversation[id, default: []].append(message)
-        currentMessages = messagesByConversation[id] ?? []
+        // Single write to currentMessages (the @Observable source of truth);
+        // sync the dict afterward without triggering another view-tree update.
+        currentMessages.append(message)
+        messagesByConversation[id] = currentMessages
         updateConversationPreview(for: id, using: message)
     }
 
     private func replaceLastMessageInCurrentConversation(with message: ChatMessage) {
-        guard let id = selectedConversationId else {
+        guard let id = selectedConversationId,
+              !currentMessages.isEmpty else {
             return
         }
-        guard var messages = messagesByConversation[id], !messages.isEmpty else {
-            return
-        }
-        messages[messages.count - 1] = message
-        messagesByConversation[id] = messages
-        currentMessages = messages
+        currentMessages[currentMessages.count - 1] = message
+        messagesByConversation[id] = currentMessages
         updateConversationPreview(for: id, using: message)
     }
 
     private func updateConversationPreview(for conversationId: String, using message: ChatMessage) {
-        if let index = conversations.firstIndex(where: { $0.id == conversationId }) {
-            conversations[index].lastMessage = String(message.content.prefix(50))
-            conversations[index].lastTimestamp = message.timestamp
+        // Skip the empty placeholder assistant bubble — otherwise every send
+        // wipes the visible last-message preview in the sidebar and forces
+        // ConversationListView (and the parent split view) to re-render twice
+        // for nothing.
+        guard !message.content.isEmpty,
+              let index = conversations.firstIndex(where: { $0.id == conversationId }) else {
+            return
         }
+        let newPreview = String(message.content.prefix(50))
+        // Avoid spurious @Observable notifications when nothing actually changed.
+        if conversations[index].lastMessage == newPreview,
+           conversations[index].lastTimestamp == message.timestamp {
+            return
+        }
+        conversations[index].lastMessage = newPreview
+        conversations[index].lastTimestamp = message.timestamp
     }
 
     private func ensureSelectedConversation() {
@@ -300,5 +322,27 @@ public final class ChatViewModel {
         if messagesByConversation[id] == nil {
             messagesByConversation[id] = []
         }
+    }
+
+    struct SlashCommand {
+        let name: String
+        let arguments: String
+    }
+
+    static func parseSlashCommand(from text: String) -> SlashCommand? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return nil }
+
+        let body = String(trimmed.dropFirst())
+        guard !body.isEmpty else { return nil }
+
+        if let spaceIndex = body.firstIndex(where: { $0.isWhitespace }) {
+            let name = String(body[..<spaceIndex])
+            let arguments = String(body[body.index(after: spaceIndex)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return SlashCommand(name: name, arguments: arguments)
+        }
+
+        return SlashCommand(name: body, arguments: "")
     }
 }

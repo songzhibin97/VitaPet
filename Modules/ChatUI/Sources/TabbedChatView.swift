@@ -40,6 +40,7 @@ public struct TabbedChatView: View {
             }
         }
         .frame(minWidth: 620, minHeight: 520)
+        .toolbar(removing: .sidebarToggle)
         .sheet(isPresented: $showCreateGroup) {
             CreateGroupView(
                 availablePets: availablePets,

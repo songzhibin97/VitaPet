@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var inputBarController: InputBarWindowController!
     private let eventBus = EventBus()
     private var timerSource: TimerSource!
+    private var hourBoundaryTimer: HourBoundaryTimerSource!
     private var workspaceMonitor: WorkspaceMonitor!
     private var notificationMonitor: NotificationMonitor!
     private var githubMonitor: GitHubMonitor!
@@ -38,12 +39,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var aiProactiveTrigger: AIProactiveTrigger?
     private var aiStatus: AIEngine.AIEngineStatus = .notConfigured
     private var ollamaService: OllamaService?
+    private var memoryWorkerService: MemoryWorkerService?
     private var interactionManager: PetInteractionManager!
     private var desktopAwareness = DesktopAwarenessController()
     private var timeWeatherController = TimeWeatherController()
     private var miniGameManager = MiniGameManager()
     private var pomodoroController = PomodoroController()
     private var conversationTurnCount = 0
+    private static let memoryExtractionEveryNTurns = 2
+    private var memoryRemoteSyncTask: Task<Void, Never>?
+    /// 周期性把本地未同步的记忆推到远端，避免单次失败后只能等下次抽取/重启才重传。
+    private static let memoryRemoteFlushInterval: UInt64 = 10 * 60 * 1_000_000_000
     private let maximumPets = 5
     private let windowDetector = WindowDetector()
 
@@ -56,9 +62,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         aiProactiveTrigger?.stop()
         timeWeatherController.stop()
+        memoryRemoteSyncTask?.cancel()
+        memoryRemoteSyncTask = nil
         VitaPetApp.releaseAppLock()
 
         let timerSource = timerSource
+        let hourBoundaryTimer = hourBoundaryTimer
         let sitReminderTimer = sitReminderTimer
         let workspaceMonitor = workspaceMonitor
         let notificationMonitor = notificationMonitor
@@ -73,6 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             await timerSource?.stop()
+            await hourBoundaryTimer?.stop()
             await sitReminderTimer?.stop()
             await workspaceMonitor?.stop()
             await notificationMonitor?.stop()
@@ -94,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let configManager = ConfigManager()
         let databaseManager = DatabaseManager()
         L10n.locale = configManager.config.locale
+        installMainMenuIfNeeded()
         let initialEndpointValue = Self.normalizedAIEndpoint(configManager.config.ollamaEndpoint)
         let initialBackend = Self.inferredAIBackend(
             preferred: Self.resolvedAIBackend(from: configManager.config.aiBackend),
@@ -107,6 +118,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backend: initialBackend
         )
         self.ollamaService = ollamaService
+        let initialMemoryConfig = Self.memoryWorkerConfig(from: configManager.config)
+        if initialMemoryConfig.enabled {
+            self.memoryWorkerService = MemoryWorkerService(config: initialMemoryConfig)
+        } else {
+            self.memoryWorkerService = nil
+        }
         await ollamaService.updateSystemPrompt(configManager.config.aiSystemPrompt)
 
         Task {
@@ -143,6 +160,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 for controller in self.petWindowControllers.values {
                     await controller.handleAnimationTrigger(.custom("celebrate"))
                 }
+
+                self.conversationTurnCount += 1
+                if self.conversationTurnCount % Self.memoryExtractionEveryNTurns == 0 {
+                    Task { await self.runMemoryExtractionCycle() }
+                }
             }
         }
         chatViewModel.onConversationChanged = { [weak self] conversationId in
@@ -153,6 +175,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task {
                 await self.ollamaService?.switchSession(conversationId)
             }
+        }
+        chatViewModel.onSlashCommand = { [weak self, weak chatViewModel] name, arguments in
+            guard let self else { return false }
+            return await self.handleChatSlashCommand(
+                name: name,
+                arguments: arguments,
+                chatViewModel: chatViewModel
+            )
         }
         chatViewModel.onCreateGroup = { [weak self] _, _ in
             guard let self, let databaseManager = self.databaseManager else {
@@ -213,11 +243,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 chatViewModel.refreshStatus()
             }
         }
+        let onSaveAIMemoryConfig: @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = {
+            [weak self, weak configManager] enabled, endpoint, authMode, username, secret, scope, subject, queryLimit in
+            guard let self,
+                  let configManager else {
+                return
+            }
+
+            let resolvedEndpoint = Self.normalizedMemoryWorkerEndpoint(endpoint)
+            let resolvedAuthMode = Self.resolvedMemoryWorkerAuthMode(from: authMode)
+            let trimmedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedSecret = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedScope = Self.normalizedMemoryWorkerScope(scope)
+            let resolvedSubject = Self.normalizedMemoryWorkerSubject(subject)
+            let resolvedQueryLimit = Self.normalizedMemoryWorkerQueryLimit(queryLimit)
+
+            do {
+                try configManager.update {
+                    $0.memoryWorkerEnabled = enabled
+                    $0.memoryWorkerEndpoint = resolvedEndpoint
+                    $0.memoryWorkerAuthMode = resolvedAuthMode.rawValue
+                    $0.memoryWorkerUsername = trimmedUsername
+                    $0.memoryWorkerSecret = trimmedSecret
+                    $0.memoryWorkerScope = resolvedScope
+                    $0.memoryWorkerSubject = resolvedSubject
+                    $0.memoryWorkerQueryLimit = resolvedQueryLimit
+                }
+            } catch {
+                AppLogger.error("Failed to save memory worker config: \(error.localizedDescription)")
+                return
+            }
+
+            let memoryConfig = Self.memoryWorkerConfig(from: configManager.config)
+            if memoryConfig.enabled {
+                if let service = self.memoryWorkerService {
+                    Task {
+                        await service.updateConfig(memoryConfig)
+                        await self.pushUnsyncedMemoriesToRemote()
+                    }
+                } else {
+                    self.memoryWorkerService = MemoryWorkerService(config: memoryConfig)
+                    Task {
+                        await self.pushUnsyncedMemoriesToRemote()
+                    }
+                }
+            } else {
+                self.memoryWorkerService = nil
+            }
+        }
         let onTestConnection: @MainActor () -> Void = { [weak self] in
             Task {
                 await ollamaService.checkConnection()
                 chatViewModel.refreshStatus()
                 self?.aiStatus = await ollamaService.status
+            }
+        }
+        let onTestAIMemoryConnection: @MainActor () async -> String? = { [weak configManager] in
+            guard let configManager else {
+                return "配置管理器未初始化"
+            }
+
+            let resolvedConfig = Self.memoryWorkerConfig(from: configManager.config)
+            let testConfig = MemoryWorkerConfig(
+                enabled: true,
+                endpoint: resolvedConfig.endpoint,
+                authMode: resolvedConfig.authMode,
+                username: resolvedConfig.username,
+                secret: resolvedConfig.secret,
+                namespace: resolvedConfig.namespace,
+                scope: resolvedConfig.scope,
+                subject: resolvedConfig.subject,
+                queryLimit: resolvedConfig.queryLimit,
+                createHorizon: resolvedConfig.createHorizon
+            )
+
+            let service = MemoryWorkerService(config: testConfig)
+
+            do {
+                _ = try await service.queryMemories(q: "connection test")
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }
+        let onTestAIMemoryWrite: @MainActor () async -> String? = { [weak configManager] in
+            guard let configManager else {
+                return "配置管理器未初始化"
+            }
+            let resolvedConfig = Self.memoryWorkerConfig(from: configManager.config)
+            guard resolvedConfig.enabled else {
+                return "请先启用「远程记忆服务」"
+            }
+            let testConfig = MemoryWorkerConfig(
+                enabled: true,
+                endpoint: resolvedConfig.endpoint,
+                authMode: resolvedConfig.authMode,
+                username: resolvedConfig.username,
+                secret: resolvedConfig.secret,
+                namespace: resolvedConfig.namespace,
+                scope: resolvedConfig.scope,
+                subject: resolvedConfig.subject,
+                queryLimit: resolvedConfig.queryLimit,
+                createHorizon: resolvedConfig.createHorizon
+            )
+            let service = MemoryWorkerService(config: testConfig)
+            let token = String(UUID().uuidString.prefix(8))
+            do {
+                _ = try await service.createMemory(
+                    content: "VitaPet 写入自检 \(token)",
+                    category: "fact",
+                    importance: 1,
+                    tags: ["vitapet-self-test", token]
+                )
+                return nil
+            } catch {
+                return error.localizedDescription
             }
         }
         let onSaveNotificationConfig: @MainActor (String, Bool, Int, String) -> Void = { [weak configManager] token, enabled, port, secret in
@@ -243,6 +383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             try await databaseManager.initialize()
+            try await databaseManager.migrateMemoryHashesToStableFingerprintIfNeeded()
         } catch {
             AppLogger.error("Failed to initialize database: \(error.localizedDescription)")
         }
@@ -260,14 +401,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
-        do {
-            let memories = try await databaseManager.fetchMemories(limit: 20)
-            await ollamaService.updateMemories(memories.map(\.content))
-        } catch {
-            AppLogger.error("Failed to load AI memories: \(error.localizedDescription)")
-        }
-
         self.databaseManager = databaseManager
+        await syncFromRemoteMemories(databaseManager: databaseManager)
+        await pushUnsyncedMemoriesToRemote()
+        await refreshMemoryContext()
+        startMemoryRemoteSyncTaskIfNeeded()
         Task {
             try? await databaseManager.pruneOldEvents(keepDays: 30)
         }
@@ -495,6 +633,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             aiSystemPrompt: { [weak configManager] in
                 configManager?.config.aiSystemPrompt ?? ""
             },
+            memoryWorkerEnabled: { [weak configManager] in
+                configManager?.config.memoryWorkerEnabled ?? false
+            },
+            memoryWorkerEndpoint: { [weak configManager] in
+                configManager?.config.memoryWorkerEndpoint ?? "https://memory.example.com"
+            },
+            memoryWorkerAuthMode: { [weak configManager] in
+                let rawValue = configManager?.config.memoryWorkerAuthMode ?? "basic"
+                return Self.resolvedMemoryWorkerAuthMode(from: rawValue).rawValue
+            },
+            memoryWorkerUsername: { [weak configManager] in
+                configManager?.config.memoryWorkerUsername ?? ""
+            },
+            memoryWorkerSecret: { [weak configManager] in
+                configManager?.config.memoryWorkerSecret ?? ""
+            },
+            memoryWorkerScope: { [weak configManager] in
+                configManager?.config.memoryWorkerScope ?? "user"
+            },
+            memoryWorkerSubject: { [weak configManager] in
+                configManager?.config.memoryWorkerSubject ?? "demo-user"
+            },
+            memoryWorkerQueryLimit: { [weak configManager] in
+                configManager?.config.memoryWorkerQueryLimit ?? 5
+            },
             aiStatus: { [weak self] in
                 Self.chatUIStatus(from: self?.aiStatus ?? .notConfigured)
             },
@@ -502,7 +665,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onTestConnection()
                 self?.aiStatus = .connecting
             },
-            onSaveAIConfig: onSaveAIConfig
+            onTestAIMemoryConnection: onTestAIMemoryConnection,
+            onTestAIMemoryWrite: onTestAIMemoryWrite,
+            onSaveAIConfig: onSaveAIConfig,
+            onSaveAIMemoryConfig: onSaveAIMemoryConfig
         )
         chatController.configureNotificationSettings(
             githubToken: { [weak configManager] in
@@ -966,6 +1132,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 do {
                     let systemPrompt = self.configManager.config.aiSystemPrompt
                     await ollamaService.updateSystemPrompt(systemPrompt)
+
+                    await self.refreshMemoryContext()
+
                     let targetPets = self.configManager.config.pets.filter { effectiveTargetPetIDs.contains($0.id) }
                     let isGroupChat = effectiveTargetPetIDs.count > 1
                     let sessionId = await MainActor.run {
@@ -1080,21 +1249,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
 
                     self.conversationTurnCount += 1
-                    if self.conversationTurnCount % 5 == 0 {
+                    if self.conversationTurnCount % Self.memoryExtractionEveryNTurns == 0 {
                         Task {
-                            do {
-                                let recentTurns = try await databaseManager.fetchRecentTurns(limit: 10)
-                                let newMemories = try await ollamaService.extractMemories(
-                                    from: recentTurns.map { (role: $0.role, content: $0.content) }
-                                )
-                                for memory in newMemories {
-                                    try? await databaseManager.insertMemory(content: memory, category: "auto")
-                                }
-                                let allMemories = try await databaseManager.fetchMemories(limit: 20)
-                                await ollamaService.updateMemories(allMemories.map(\.content))
-                            } catch {
-                                AppLogger.error("Failed to extract memories: \(error.localizedDescription)")
-                            }
+                            await self.runMemoryExtractionCycle()
                         }
                     }
                 } catch {
@@ -1332,6 +1489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         aiProactiveTrigger?.start()
 
         timerSource = TimerSource(interval: 10.0)
+        hourBoundaryTimer = HourBoundaryTimerSource()
         sitReminderTimer = TimerSource(interval: 1800, sourceId: "sit-reminder")
         workspaceMonitor = WorkspaceMonitor()
         notificationMonitor = NotificationMonitor()
@@ -1359,6 +1517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         await timerSource.start(publishingTo: eventBus)
+        await hourBoundaryTimer.start(publishingTo: eventBus)
         await sitReminderTimer.start(publishingTo: eventBus)
         await workspaceMonitor.start(publishingTo: eventBus)
         await notificationMonitor.start(publishingTo: eventBus)
@@ -1736,6 +1895,392 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = await capabilityManager.status(of: .basePet)
     }
 
+    // MARK: - Memory pipeline
+
+    private static func memoryContentHash(_ content: String) -> String {
+        MemoryContentHasher.stableHash(content)
+    }
+
+    /// Full extraction cycle: pulls recent turns, asks LLM to extract structured memories,
+    /// dedups against existing local rows (by content_hash), inserts new ones, pushes to
+    /// remote if configured, and refreshes the LLM context.
+    private func runMemoryExtractionCycle() async {
+        guard let ollamaService = self.ollamaService,
+              let databaseManager = self.databaseManager else {
+            return
+        }
+
+        do {
+            let recentTurns = try await databaseManager.fetchRecentTurns(limit: 20)
+            guard !recentTurns.isEmpty else {
+                AppLogger.info("Memory extraction skipped: no recent turns")
+                await pushUnsyncedMemoriesToRemote()
+                await refreshMemoryContext()
+                return
+            }
+
+            AppLogger.info("Memory extraction starting from \(recentTurns.count) turns")
+            let extracted = try await ollamaService.extractStructuredMemories(
+                from: recentTurns.map { (role: $0.role, content: $0.content) }
+            )
+            AppLogger.info("Memory extraction returned \(extracted.count) candidates")
+            guard !extracted.isEmpty else {
+                await pushUnsyncedMemoriesToRemote()
+                await refreshMemoryContext()
+                return
+            }
+
+            for memory in extracted {
+                let hash = Self.memoryContentHash(memory.content)
+                if (try? await databaseManager.memoryExists(contentHash: hash)) == true {
+                    continue
+                }
+
+                do {
+                    let localId = try await databaseManager.insertMemory(
+                        content: memory.content,
+                        category: memory.category.rawValue,
+                        importance: memory.importance,
+                        source: "auto",
+                        contentHash: hash
+                    )
+
+                    if let memoryWorkerService = self.memoryWorkerService {
+                        do {
+                            let remote = try await memoryWorkerService.createMemory(
+                                content: memory.content,
+                                category: memory.category.rawValue,
+                                importance: memory.importance,
+                                tags: ["auto", memory.category.rawValue]
+                            )
+                            let remoteId = remote.id.map(String.init)
+                            do {
+                                try await databaseManager.markMemorySynced(id: localId, remoteId: remoteId)
+                            } catch {
+                                AppLogger.error(
+                                    "Remote memory created but failed to mark synced locally: \(error.localizedDescription)"
+                                )
+                            }
+                        } catch {
+                            AppLogger.error("Failed to create remote memory: \(error.localizedDescription)")
+                        }
+                    }
+                } catch {
+                    AppLogger.error("Failed to insert memory: \(error.localizedDescription)")
+                }
+            }
+
+            await pushUnsyncedMemoriesToRemote()
+            await refreshMemoryContext()
+        } catch {
+            AppLogger.error("Memory extraction cycle failed: \(error.localizedDescription)")
+            await pushUnsyncedMemoriesToRemote()
+            await refreshMemoryContext()
+        }
+    }
+
+    /// 启动一个后台任务，周期性 flush 未同步记忆。重复调用会先取消旧任务。
+    /// 即便 `memoryWorkerService` 暂时为 nil 也无所谓——`pushUnsyncedMemoriesToRemote` 会直接返回。
+    private func startMemoryRemoteSyncTaskIfNeeded() {
+        memoryRemoteSyncTask?.cancel()
+        memoryRemoteSyncTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: AppDelegate.memoryRemoteFlushInterval)
+                } catch {
+                    return
+                }
+                guard let self else { return }
+                await self.pushUnsyncedMemoriesToRemote()
+            }
+        }
+    }
+
+    /// 当前本地存在、但还没被远端确认的记忆条数。0 表示一切都已同步。
+    func unsyncedMemoryCount() async -> Int {
+        guard let databaseManager = self.databaseManager else { return 0 }
+        return (try? await databaseManager.unsyncedMemoryCount()) ?? 0
+    }
+
+    /// 立即触发一次推送，返回此前未同步的条数（用于在 UI 里给一个明确的反馈）。
+    @discardableResult
+    func flushUnsyncedMemoriesNow() async -> Int {
+        let before = await unsyncedMemoryCount()
+        await pushUnsyncedMemoriesToRemote()
+        return before
+    }
+
+    /// Uploads local rows that never got `synced_at` (e.g. worker was off or the network failed once).
+    private func pushUnsyncedMemoriesToRemote() async {
+        guard let databaseManager = self.databaseManager,
+              let memoryWorkerService = self.memoryWorkerService else {
+            return
+        }
+
+        do {
+            let pending = try await databaseManager.fetchUnsyncedMemoryRecords(limit: 200)
+            guard !pending.isEmpty else { return }
+
+            AppLogger.info("Memory worker: uploading \(pending.count) previously unsynced local memories")
+            for record in pending {
+                do {
+                    var tags = [record.source, record.category].map {
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }.filter { !$0.isEmpty }
+                    if tags.isEmpty {
+                        tags = ["auto"]
+                    }
+                    let remote = try await memoryWorkerService.createMemory(
+                        content: record.content,
+                        category: record.category,
+                        importance: record.importance,
+                        tags: tags
+                    )
+                    try await databaseManager.markMemorySynced(
+                        id: record.id,
+                        remoteId: remote.id.map(String.init)
+                    )
+                } catch {
+                    AppLogger.error(
+                        "Failed to push unsynced memory id=\(record.id): \(error.localizedDescription)"
+                    )
+                }
+            }
+        } catch {
+            AppLogger.error("Failed to read unsynced memories: \(error.localizedDescription)")
+        }
+    }
+
+    /// Recompute and push the memory block to the current AI service.
+    @discardableResult
+    func refreshMemoryContext() async -> [DatabaseManager.MemoryRecord] {
+        guard let databaseManager = self.databaseManager else { return [] }
+
+        let local = (try? await databaseManager.fetchMemoryRecords(limit: 40)) ?? []
+        let items = local.map {
+            MemoryContextItem(
+                content: $0.content,
+                category: MemoryCategory(rawValue: $0.category) ?? .fact,
+                importance: $0.importance
+            )
+        }
+
+        await ollamaService?.updateStructuredMemories(items)
+        return local
+    }
+
+    enum ManualMemoryOutcome {
+        /// 已存入；`storedContent` 是最终落库的文本，`synthesized=true` 表示走了 LLM 合成。
+        case inserted(storedContent: String, category: MemoryCategory, synthesized: Bool)
+        case duplicate
+        case failed
+    }
+
+    /// Record a memory the user explicitly asked to remember (slash command / menu).
+    /// 走一次 LLM 合成：把用户原话改写成第三人称陈述（"用户……"），再入库 + 推远端。
+    /// 合成失败或 LLM 不可用时回退到原话，避免命令完全失败。
+    @discardableResult
+    func recordManualMemory(content: String, category: MemoryCategory = .fact) async -> ManualMemoryOutcome {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let databaseManager = self.databaseManager else { return .failed }
+
+        let synthesized: ExtractedMemory? = await synthesizeManualMemory(rawInput: trimmed)
+        let storedContent = synthesized?.content ?? trimmed
+        let storedCategory = synthesized?.category ?? category
+        // 用户主动 /记住 默认仍按高优先级处理，不让 LLM 把它压到 1。
+        let storedImportance = max(3, synthesized?.importance ?? 3)
+        let didSynthesize = synthesized != nil
+
+        let hash = Self.memoryContentHash(storedContent)
+        if (try? await databaseManager.memoryExists(contentHash: hash)) == true {
+            await refreshMemoryContext()
+            return .duplicate
+        }
+
+        do {
+            let localId = try await databaseManager.insertMemory(
+                content: storedContent,
+                category: storedCategory.rawValue,
+                importance: storedImportance,
+                source: "manual",
+                contentHash: hash
+            )
+
+            if let memoryWorkerService = self.memoryWorkerService {
+                do {
+                    let remote = try await memoryWorkerService.createMemory(
+                        content: storedContent,
+                        category: storedCategory.rawValue,
+                        importance: storedImportance,
+                        tags: ["manual", storedCategory.rawValue]
+                    )
+                    try? await databaseManager.markMemorySynced(id: localId, remoteId: remote.id.map(String.init))
+                } catch {
+                    AppLogger.error("Failed to sync manual memory: \(error.localizedDescription)")
+                }
+            }
+
+            await refreshMemoryContext()
+            return .inserted(storedContent: storedContent, category: storedCategory, synthesized: didSynthesize)
+        } catch {
+            AppLogger.error("Failed to save manual memory: \(error.localizedDescription)")
+            return .failed
+        }
+    }
+
+    /// 把单条用户原话送给抽取链条，取第一条返回。失败/为空都返回 nil（调用方用原话兜底）。
+    private func synthesizeManualMemory(rawInput: String) async -> ExtractedMemory? {
+        guard let ollamaService = self.ollamaService else { return nil }
+        do {
+            let extracted = try await ollamaService.extractStructuredMemories(
+                from: [(role: "user", content: rawInput)]
+            )
+            return extracted.first
+        } catch {
+            AppLogger.error("Manual memory synthesis failed, falling back to raw text: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func deleteMemoryRecord(id: Int64) async {
+        guard let databaseManager = self.databaseManager else { return }
+        do {
+            try await databaseManager.deleteMemory(id: id)
+            await refreshMemoryContext()
+        } catch {
+            AppLogger.error("Failed to delete memory: \(error.localizedDescription)")
+        }
+    }
+
+    func loadMemoryRecords(keyword: String? = nil) async -> [DatabaseManager.MemoryRecord] {
+        guard let databaseManager = self.databaseManager else { return [] }
+        let trimmed = keyword?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmed, !trimmed.isEmpty {
+            return (try? await databaseManager.searchMemoryRecords(keyword: trimmed, limit: 100)) ?? []
+        }
+        return (try? await databaseManager.fetchMemoryRecords(limit: 100)) ?? []
+    }
+
+    /// Handles `/command arguments` messages typed in the chat window. Returns true if the
+    /// command was recognised (caller should not forward the message to the AI).
+    @discardableResult
+    func handleChatSlashCommand(
+        name: String,
+        arguments: String,
+        chatViewModel: ChatViewModel?
+    ) async -> Bool {
+        let normalized = name.lowercased()
+        let trimmedArgs = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch normalized {
+        case "记住", "记下", "remember":
+            if trimmedArgs.isEmpty {
+                chatViewModel?.addAssistantMessage("请在命令后面写要记住的内容，例如：/记住 我生日是 6 月 3 日")
+                return true
+            }
+            switch await recordManualMemory(content: trimmedArgs, category: .fact) {
+            case .inserted(let storedContent, let category, let synthesized):
+                let prefix = synthesized
+                    ? "好的，我记下了 📌（已整理为 \(category.displayName)）"
+                    : "好的，我记下了 📌（AI 不可用，按原话保存）"
+                chatViewModel?.addAssistantMessage("\(prefix)\n→ \(storedContent)")
+            case .duplicate:
+                chatViewModel?.addAssistantMessage("这条我已经记过了")
+            case .failed:
+                chatViewModel?.addAssistantMessage("没存上，去 Console 查看日志看看哪里出错了")
+            }
+            return true
+
+        case "记忆", "memories":
+            let records = await loadMemoryRecords()
+            if records.isEmpty {
+                chatViewModel?.addAssistantMessage("目前还没有存下任何记忆")
+            } else {
+                let unsynced = await unsyncedMemoryCount()
+                let header: String
+                if memoryWorkerService == nil {
+                    header = "当前记忆（远端未配置，全部仅本地）："
+                } else if unsynced == 0 {
+                    header = "当前记忆（☁️ 表示已同步远端，全部已同步）："
+                } else {
+                    header = "当前记忆（☁️ 表示已同步远端，未同步 \(unsynced) 条，可用 /同步 立即推送）："
+                }
+                let lines = records.prefix(10).map { record -> String in
+                    let cat = (MemoryCategory(rawValue: record.category) ?? .fact).displayName
+                    let syncFlag = record.syncedAt != nil ? " ☁️" : ""
+                    return "• [\(cat)] \(record.content)\(syncFlag)"
+                }
+                let suffix = records.count > 10 ? "\n...共 \(records.count) 条" : ""
+                chatViewModel?.addAssistantMessage(header + "\n" + lines.joined(separator: "\n") + suffix)
+            }
+            return true
+
+        case "同步", "sync":
+            guard memoryWorkerService != nil else {
+                chatViewModel?.addAssistantMessage("还没有配置远端 Memory Worker，去 设置 → AI 设置 → 记忆 打开吧")
+                return true
+            }
+            let before = await flushUnsyncedMemoriesNow()
+            let after = await unsyncedMemoryCount()
+            if before == 0 {
+                chatViewModel?.addAssistantMessage("本地没有未同步的记忆 ✅")
+            } else if after == 0 {
+                chatViewModel?.addAssistantMessage("已把 \(before) 条记忆推到远端 ☁️")
+            } else {
+                let pushed = max(0, before - after)
+                chatViewModel?.addAssistantMessage("推送 \(pushed)/\(before) 条；还有 \(after) 条失败，下个周期会自动重试")
+            }
+            return true
+
+        case "提取", "extract":
+            chatViewModel?.addAssistantMessage("正在从最近对话中提取记忆…")
+            let before = await loadMemoryRecords()
+            await runMemoryExtractionCycle()
+            let after = await loadMemoryRecords()
+            let added = after.count - before.count
+            chatViewModel?.addAssistantMessage(added > 0 ? "提取完成，新增 \(added) 条记忆。/记忆 查看" : "提取完成，这段对话里没有抓到值得长期记住的信息")
+            return true
+
+        case "忘记", "forget":
+            chatViewModel?.addAssistantMessage("想删除具体某条记忆，请打开 设置 → AI 设置 → 记忆管理")
+            return true
+
+        default:
+            chatViewModel?.addAssistantMessage("未知命令 /\(name)。可用：/记住 <内容>、/记忆、/提取、/同步、/忘记")
+            return true
+        }
+    }
+
+    /// One-shot pull from the remote worker to hydrate local memories (useful for multi-device
+    /// scenarios). Dedups against local content_hash so repeated pulls don't duplicate rows.
+    private func syncFromRemoteMemories(databaseManager: DatabaseManager) async {
+        guard let memoryWorkerService = self.memoryWorkerService else { return }
+
+        do {
+            let remote = try await memoryWorkerService.queryMemories()
+            for item in remote {
+                let hash = Self.memoryContentHash(item.content)
+                if (try? await databaseManager.memoryExists(contentHash: hash)) == true { continue }
+                do {
+                    let localId = try await databaseManager.insertMemory(
+                        content: item.content,
+                        category: MemoryCategory.fact.rawValue,
+                        importance: 1,
+                        source: "remote",
+                        contentHash: hash
+                    )
+                    if let remoteId = item.id.map(String.init) {
+                        try? await databaseManager.markMemorySynced(id: localId, remoteId: remoteId)
+                    }
+                } catch {
+                    AppLogger.error("Failed to hydrate remote memory: \(error.localizedDescription)")
+                }
+            }
+        } catch {
+            AppLogger.error("Failed to pull remote memories: \(error.localizedDescription)")
+        }
+    }
+
     private var primaryPetController: PetWindowController? {
         configManager?.config.pets.first.flatMap { petWindowControllers[$0.id] }
     }
@@ -2039,6 +2584,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             parts.append("爱好：\(pet.hobbies)。")
         }
         return parts.joined(separator: "")
+    }
+
+    private func installMainMenuIfNeeded() {
+        guard NSApp.mainMenu == nil else {
+            return
+        }
+
+        let mainMenu = NSMenu(title: "MainMenu")
+
+        // App menu
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu(title: "VitaPet")
+        appMenuItem.submenu = appMenu
+
+        let quitItem = NSMenuItem(
+            title: L10n.menuQuit,
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quitItem.keyEquivalentModifierMask = [.command]
+        appMenu.addItem(quitItem)
+
+        // Edit menu
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenuItem.submenu = editMenu
+
+        let undoItem = NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        undoItem.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(undoItem)
+
+        let redoItem = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redoItem)
+
+        editMenu.addItem(.separator())
+
+        let cutItem = NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        cutItem.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(cutItem)
+
+        let copyItem = NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        copyItem.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(copyItem)
+
+        let pasteItem = NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        pasteItem.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(pasteItem)
+
+        editMenu.addItem(.separator())
+
+        let selectAllItem = NSMenuItem(title: "Select All", action: #selector(NSResponder.selectAll(_:)), keyEquivalent: "a")
+        selectAllItem.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(selectAllItem)
+
+        NSApp.mainMenu = mainMenu
     }
 
     nonisolated private static func chatUIStatus(from status: AIEngine.AIEngineStatus) -> ChatUI.AIEngineStatus {
@@ -2480,5 +3083,101 @@ private extension AppDelegate {
         }
 
         return trimmed
+    }
+
+    static func resolvedMemoryWorkerAuthMode(from rawValue: String) -> MemoryWorkerAuthMode {
+        MemoryWorkerAuthMode(rawValue: rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) ?? .basic
+    }
+
+    static func normalizedMemoryWorkerEndpoint(
+        _ rawValue: String,
+        fallback: String = "https://memory.example.com"
+    ) -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return fallback
+        }
+
+        if trimmed.contains("://") {
+            return trimmed
+        }
+
+        return "https://\(trimmed)"
+    }
+
+    static func normalizedMemoryWorkerScope(_ rawValue: String, fallback: String = "user") -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    static func normalizedMemoryWorkerSubject(_ rawValue: String, fallback: String = "") -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, trimmed != "demo-user" {
+            return trimmed
+        }
+
+        let explicitFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !explicitFallback.isEmpty {
+            return explicitFallback
+        }
+
+        let systemUser = NSUserName().trimmingCharacters(in: .whitespacesAndNewlines)
+        return systemUser.isEmpty ? "default" : systemUser
+    }
+
+    static func normalizedMemoryWorkerQueryLimit(_ rawValue: Int, fallback: Int = 5) -> Int {
+        let resolved = rawValue <= 0 ? fallback : rawValue
+        return max(1, min(100, resolved))
+    }
+
+    static func normalizedMemoryWorkerHorizon(_ rawValue: String, fallback: String = "daily") -> String {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "daily", "weekly", "monthly", "permanent":
+            return normalized
+        default:
+            return fallback
+        }
+    }
+
+    static func memoryWorkerConfig(from config: ConfigManager.AppConfig) -> MemoryWorkerConfig {
+        MemoryWorkerConfig(
+            enabled: config.memoryWorkerEnabled,
+            endpoint: normalizedMemoryWorkerEndpoint(config.memoryWorkerEndpoint),
+            authMode: resolvedMemoryWorkerAuthMode(from: config.memoryWorkerAuthMode),
+            username: config.memoryWorkerUsername.trimmingCharacters(in: .whitespacesAndNewlines),
+            secret: config.memoryWorkerSecret.trimmingCharacters(in: .whitespacesAndNewlines),
+            namespace: config.memoryWorkerNamespace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "default"
+                : config.memoryWorkerNamespace.trimmingCharacters(in: .whitespacesAndNewlines),
+            scope: normalizedMemoryWorkerScope(config.memoryWorkerScope),
+            subject: normalizedMemoryWorkerSubject(config.memoryWorkerSubject),
+            queryLimit: normalizedMemoryWorkerQueryLimit(config.memoryWorkerQueryLimit),
+            createHorizon: normalizedMemoryWorkerHorizon(config.memoryWorkerCreateHorizon)
+        )
+    }
+
+    static func mergeMemories(local: [String], remote: [String], maxCount: Int) -> [String] {
+        var ordered: [String] = []
+        var seen: Set<String> = []
+
+        for memory in remote + local {
+            let trimmed = memory.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                continue
+            }
+
+            let key = trimmed.lowercased()
+            guard seen.insert(key).inserted else {
+                continue
+            }
+
+            ordered.append(trimmed)
+            if ordered.count >= max(1, maxCount) {
+                break
+            }
+        }
+
+        return ordered
     }
 }

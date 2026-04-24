@@ -166,11 +166,12 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             return
         }
 
-        if let image = NSImage(systemSymbolName: "pawprint.fill", accessibilityDescription: "VitaPet") {
+        if let image = NSImage(systemSymbolName: "cat.fill", accessibilityDescription: "VitaPet")
+            ?? NSImage(systemSymbolName: "pawprint.fill", accessibilityDescription: "VitaPet") {
             image.isTemplate = true
             button.image = image
         } else {
-            button.title = "🐾"
+            button.title = "🐱"
         }
 
         button.toolTip = tooltip(for: currentMoodLevel())

@@ -154,6 +154,18 @@ public struct SettingsView: View {
     @State private var aiBackend: AIEngine.AIBackend
     @State private var ollamaModel: String
     @State private var aiSystemPrompt: String
+    @State private var memoryWorkerEnabled: Bool
+    @State private var memoryWorkerEndpoint: String
+    @State private var memoryWorkerAuthMode: String
+    @State private var memoryWorkerUsername: String
+    @State private var memoryWorkerSecret: String
+    @State private var memoryWorkerScope: String
+    @State private var memoryWorkerSubject: String
+    @State private var memoryWorkerQueryLimit: Int
+    @State private var memoryWorkerConnectionMessage: String?
+    @State private var memoryWorkerConnectionFailed: Bool
+    @State private var memoryWorkerWriteMessage: String?
+    @State private var memoryWorkerWriteFailed: Bool
     @State private var liveAIStatus: AIEngineStatus
     @State private var githubToken: String
     @State private var webhookEnabled: Bool
@@ -192,7 +204,10 @@ public struct SettingsView: View {
     private let loadPetProfiles: @MainActor () -> [PetProfileItem]
     private let aiStatusProvider: @MainActor () -> AIEngineStatus
     private let onTestConnection: @MainActor () -> Void
+    private let onTestAIMemoryConnection: @MainActor () async -> String?
+    private let onTestAIMemoryWrite: @MainActor () async -> String?
     private let onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend) -> Void
+    private let onSaveAIMemoryConfig: @MainActor (Bool, String, String, String, String, String, String, Int) -> Void
     private let onSaveNotificationConfig: @MainActor (String, Bool, Int, String) -> Void
     private let onUpdatePet: @MainActor (UUID, String, String, Double, String, String, String, String) -> Void
     private let onUpdatePetSound: @MainActor (UUID, Bool?, Float?) -> Void
@@ -230,6 +245,14 @@ public struct SettingsView: View {
         aiBackend: AIEngine.AIBackend = .ollama,
         ollamaModel: String = "llama3.2",
         aiSystemPrompt: String = "",
+        memoryWorkerEnabled: Bool = false,
+        memoryWorkerEndpoint: String = "https://memory.example.com",
+        memoryWorkerAuthMode: String = "basic",
+        memoryWorkerUsername: String = "",
+        memoryWorkerSecret: String = "",
+        memoryWorkerScope: String = "user",
+        memoryWorkerSubject: String = "demo-user",
+        memoryWorkerQueryLimit: Int = 5,
         githubToken: String = "",
         webhookEnabled: Bool = false,
         webhookPort: Int = 19280,
@@ -237,7 +260,10 @@ public struct SettingsView: View {
         aiStatus: AIEngineStatus = .notConfigured,
         aiStatusProvider: @escaping @MainActor () -> AIEngineStatus = { .notConfigured },
         onTestConnection: @escaping @MainActor () -> Void = {},
+        onTestAIMemoryConnection: @escaping @MainActor () async -> String? = { nil },
+        onTestAIMemoryWrite: @escaping @MainActor () async -> String? = { nil },
         onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend) -> Void = { _, _, _, _ in },
+        onSaveAIMemoryConfig: @escaping @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = { _, _, _, _, _, _, _, _ in },
         onSaveNotificationConfig: @escaping @MainActor (String, Bool, Int, String) -> Void = { _, _, _, _ in },
         onUpdatePet: @escaping @MainActor (UUID, String, String, Double, String, String, String, String) -> Void = { _, _, _, _, _, _, _, _ in },
         onUpdatePetSound: @escaping @MainActor (UUID, Bool?, Float?) -> Void = { _, _, _ in },
@@ -277,6 +303,18 @@ public struct SettingsView: View {
         _aiBackend = State(initialValue: aiBackend)
         _ollamaModel = State(initialValue: ollamaModel)
         _aiSystemPrompt = State(initialValue: aiSystemPrompt)
+        _memoryWorkerEnabled = State(initialValue: memoryWorkerEnabled)
+        _memoryWorkerEndpoint = State(initialValue: memoryWorkerEndpoint)
+        _memoryWorkerAuthMode = State(initialValue: memoryWorkerAuthMode)
+        _memoryWorkerUsername = State(initialValue: memoryWorkerUsername)
+        _memoryWorkerSecret = State(initialValue: memoryWorkerSecret)
+        _memoryWorkerScope = State(initialValue: memoryWorkerScope)
+        _memoryWorkerSubject = State(initialValue: memoryWorkerSubject)
+        _memoryWorkerQueryLimit = State(initialValue: max(1, min(100, memoryWorkerQueryLimit)))
+        _memoryWorkerConnectionMessage = State(initialValue: nil)
+        _memoryWorkerConnectionFailed = State(initialValue: false)
+        _memoryWorkerWriteMessage = State(initialValue: nil)
+        _memoryWorkerWriteFailed = State(initialValue: false)
         _liveAIStatus = State(initialValue: aiStatus)
         _githubToken = State(initialValue: githubToken)
         _webhookEnabled = State(initialValue: webhookEnabled)
@@ -312,7 +350,10 @@ public struct SettingsView: View {
         self.loadPetProfiles = loadPetProfiles
         self.aiStatusProvider = aiStatusProvider
         self.onTestConnection = onTestConnection
+        self.onTestAIMemoryConnection = onTestAIMemoryConnection
+        self.onTestAIMemoryWrite = onTestAIMemoryWrite
         self.onSaveAIConfig = onSaveAIConfig
+        self.onSaveAIMemoryConfig = onSaveAIMemoryConfig
         self.onSaveNotificationConfig = onSaveNotificationConfig
         self.onUpdatePet = onUpdatePet
         self.onUpdatePetSound = onUpdatePetSound
@@ -879,6 +920,131 @@ public struct SettingsView: View {
                         )
                 }
 
+                Divider()
+                    .padding(.vertical, 2)
+
+                Text("远程记忆服务")
+                    .font(.headline)
+
+                Toggle("启用远程记忆服务", isOn: $memoryWorkerEnabled)
+                    .onChange(of: memoryWorkerEnabled) { _, _ in
+                        saveAIMemoryConfig()
+                    }
+
+                TextField("Memory API 地址", text: $memoryWorkerEndpoint)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: memoryWorkerEndpoint) { _, _ in
+                        saveAIMemoryConfig()
+                    }
+
+                Picker("鉴权方式", selection: $memoryWorkerAuthMode) {
+                    Text("Basic").tag("basic")
+                    Text("Bearer").tag("bearer")
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: memoryWorkerAuthMode) { _, _ in
+                    saveAIMemoryConfig()
+                }
+
+                if memoryWorkerAuthMode == "bearer" {
+                    SecureField("Bearer Token", text: $memoryWorkerSecret)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: memoryWorkerSecret) { _, _ in
+                            saveAIMemoryConfig()
+                        }
+                } else {
+                    TextField("用户名", text: $memoryWorkerUsername)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: memoryWorkerUsername) { _, _ in
+                            saveAIMemoryConfig()
+                        }
+
+                    SecureField("密码 / API Secret", text: $memoryWorkerSecret)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: memoryWorkerSecret) { _, _ in
+                            saveAIMemoryConfig()
+                        }
+                }
+
+                TextField("记忆 Subject（用户 ID）", text: $memoryWorkerSubject)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: memoryWorkerSubject) { _, _ in
+                        saveAIMemoryConfig()
+                    }
+
+                TextField("Scope", text: $memoryWorkerScope)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: memoryWorkerScope) { _, _ in
+                        saveAIMemoryConfig()
+                    }
+
+                HStack {
+                    Text("Query Limit")
+                    TextField("5", value: $memoryWorkerQueryLimit, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 80)
+                        .onChange(of: memoryWorkerQueryLimit) { _, _ in
+                            saveAIMemoryConfig()
+                        }
+                    Text("(1-100)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        Button("测试查询（读）") {
+                            Task { @MainActor in
+                                memoryWorkerConnectionMessage = "测试中..."
+                                memoryWorkerConnectionFailed = false
+
+                                if let error = await onTestAIMemoryConnection(),
+                                   !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    memoryWorkerConnectionMessage = "查询失败：\(error)"
+                                    memoryWorkerConnectionFailed = true
+                                } else {
+                                    memoryWorkerConnectionMessage = "查询成功"
+                                    memoryWorkerConnectionFailed = false
+                                }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+
+                        if let memoryWorkerConnectionMessage {
+                            Text(memoryWorkerConnectionMessage)
+                                .font(.caption)
+                                .foregroundStyle(memoryWorkerConnectionFailed ? .red : .green)
+                                .lineLimit(2)
+                        }
+                    }
+
+                    HStack(spacing: 10) {
+                        Button("测试写入一条记忆") {
+                            Task { @MainActor in
+                                memoryWorkerWriteMessage = "写入中..."
+                                memoryWorkerWriteFailed = false
+
+                                if let error = await onTestAIMemoryWrite(),
+                                   !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    memoryWorkerWriteMessage = "写入失败：\(error)"
+                                    memoryWorkerWriteFailed = true
+                                } else {
+                                    memoryWorkerWriteMessage = "写入成功（服务端应新增一条测试记忆）"
+                                    memoryWorkerWriteFailed = false
+                                }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+
+                        if let memoryWorkerWriteMessage {
+                            Text(memoryWorkerWriteMessage)
+                                .font(.caption)
+                                .foregroundStyle(memoryWorkerWriteFailed ? .red : .green)
+                                .lineLimit(3)
+                        }
+                    }
+                }
+
                 Button(L10n.settingsAITestConnection) {
                     liveAIStatus = .connecting
                     onTestConnection()
@@ -1238,6 +1404,32 @@ public struct SettingsView: View {
         case .error:
             return .red
         }
+    }
+
+    private func saveAIMemoryConfig() {
+        let trimmedEndpoint = memoryWorkerEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAuthMode = memoryWorkerAuthMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let resolvedAuthMode = (trimmedAuthMode == "bearer") ? "bearer" : "basic"
+        let trimmedUsername = memoryWorkerUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSecret = memoryWorkerSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedScope = memoryWorkerScope.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSubject = memoryWorkerSubject.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clampedLimit = max(1, min(100, memoryWorkerQueryLimit))
+
+        if clampedLimit != memoryWorkerQueryLimit {
+            memoryWorkerQueryLimit = clampedLimit
+        }
+
+        onSaveAIMemoryConfig(
+            memoryWorkerEnabled,
+            trimmedEndpoint,
+            resolvedAuthMode,
+            trimmedUsername,
+            trimmedSecret,
+            trimmedScope,
+            trimmedSubject,
+            clampedLimit
+        )
     }
 
     @ViewBuilder
