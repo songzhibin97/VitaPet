@@ -60,13 +60,14 @@ public struct MessageBubble: View, Equatable {
     }
 
     private var bubble: some View {
-        Text(parsedContent.reply.isEmpty ? " " : parsedContent.reply)
+        Text(LocalizedStringKey(parsedContent.reply.isEmpty ? " " : parsedContent.reply))
             .textSelection(.enabled)
             .foregroundStyle(foregroundColor)
             .fixedSize(horizontal: false, vertical: true)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(bubbleColor, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(bubbleColor, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .shadow(color: isUserMessage ? Color.blue.opacity(0.15) : Color.black.opacity(0.04), radius: 6, x: 0, y: 2)
             .overlay(alignment: isUserMessage ? .bottomTrailing : .bottomLeading) {
                 if isStreaming {
                     StreamingCursor()

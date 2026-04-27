@@ -48,10 +48,8 @@ for bundle in "${BIN_DIR}"/*.bundle; do
 done
 
 ICON_SRC="App/Resources/AppIcon.icns"
-if [ ! -f "${ICON_SRC}" ]; then
-  echo "==> Generating AppIcon.icns"
-  swift scripts/generate_icon.swift "🐱" "${ICON_SRC}"
-fi
+echo "==> Generating AppIcon.icns"
+swift scripts/generate_icon.swift "🐱" "${ICON_SRC}"
 cp "${ICON_SRC}" "${APP_DIR}/Contents/Resources/AppIcon.icns"
 
 cat > "${APP_DIR}/Contents/Info.plist" <<PLIST

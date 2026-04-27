@@ -442,7 +442,7 @@ final class StatusBarController: NSObject, NSMenuDelegate {
 
     private static func statusBarIconPointSize() -> CGFloat {
         let thickness = NSStatusBar.system.thickness
-        return max(16, min(19, thickness - 3))
+        return max(18, min(22, thickness - 1))
     }
 
     private static func makeStatusBarImage() -> NSImage {
@@ -453,14 +453,19 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     /// Draw a compact brand mark instead of relying on whichever SF Symbol set
     /// happens to be available on the host macOS version.
     private static func makeTemplateCatBubbleIcon(pointSize: CGFloat) -> NSImage {
-        let scale: CGFloat = 4
+        let scale: CGFloat = 8
         let canvas = pointSize * scale
         let image = NSImage(size: NSSize(width: canvas, height: canvas), flipped: false) { rect in
             guard let ctx = NSGraphicsContext.current?.cgContext else {
                 return false
             }
+            
+            // Ultra-high rendering quality and anti-aliasing for menu bar precision
+            ctx.setShouldAntialias(true)
+            ctx.setAllowsAntialiasing(true)
+            ctx.interpolationQuality = .high
 
-            let inset = canvas * 0.14
+            let inset = canvas * 0.15
             let glyph = NSRect(
                 x: inset,
                 y: inset,
@@ -472,83 +477,65 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             let gx = glyph.minX
             let gy = glyph.minY
 
-            let bubbleRect = NSRect(
-                x: gx + gw * 0.08,
-                y: gy + gh * 0.10,
-                width: gw * 0.8,
-                height: gh * 0.62
-            )
+            // Menu bar icons must be solid black paths (rendered as a template)
+            let strokeColor = NSColor.black
+            let strokeWidth = canvas * 0.095
 
-            NSColor.black.setFill()
+            // ── Cat face: line-art stroke style ───────────────────────
+            let cx  = gx + gw * 0.50
+            let fr  = gw * 0.40
+            let fcy = gy + gh * 0.40
 
-            let leftEar = NSBezierPath()
-            leftEar.move(to: NSPoint(x: gx + gw * 0.24, y: gy + gh * 0.66))
-            leftEar.line(to: NSPoint(x: gx + gw * 0.36, y: gy + gh * 0.96))
-            leftEar.line(to: NSPoint(x: gx + gw * 0.48, y: gy + gh * 0.66))
-            leftEar.close()
-            leftEar.fill()
+            let head = NSBezierPath()
+            head.lineJoinStyle = .miter
+            head.lineCapStyle  = .round
+            head.lineWidth     = strokeWidth
 
-            let rightEar = NSBezierPath()
-            rightEar.move(to: NSPoint(x: gx + gw * 0.76, y: gy + gh * 0.66))
-            rightEar.line(to: NSPoint(x: gx + gw * 0.64, y: gy + gh * 0.96))
-            rightEar.line(to: NSPoint(x: gx + gw * 0.52, y: gy + gh * 0.66))
-            rightEar.close()
-            rightEar.fill()
+            head.move(to: NSPoint(x: cx,       y: fcy - fr))
+            head.curve(to: NSPoint(x: cx + fr, y: fcy),
+                       controlPoint1: NSPoint(x: cx + fr * 0.552, y: fcy - fr),
+                       controlPoint2: NSPoint(x: cx + fr,         y: fcy - fr * 0.552))
+            head.curve(to: NSPoint(x: cx + fr * 0.70, y: fcy + fr * 0.70),
+                       controlPoint1: NSPoint(x: cx + fr,          y: fcy + fr * 0.35),
+                       controlPoint2: NSPoint(x: cx + fr * 0.88,   y: fcy + fr * 0.58))
+            head.curve(to: NSPoint(x: cx + fr * 0.22, y: fcy + fr * 0.88),
+                       controlPoint1: NSPoint(x: cx + fr * 0.72, y: fcy + fr * 1.22),
+                       controlPoint2: NSPoint(x: cx + fr * 0.20, y: fcy + fr * 1.22))
+            head.curve(to: NSPoint(x: cx - fr * 0.22, y: fcy + fr * 0.88),
+                       controlPoint1: NSPoint(x: cx + fr * 0.10, y: fcy + fr * 0.72),
+                       controlPoint2: NSPoint(x: cx - fr * 0.10, y: fcy + fr * 0.72))
+            head.curve(to: NSPoint(x: cx - fr * 0.70, y: fcy + fr * 0.70),
+                       controlPoint1: NSPoint(x: cx - fr * 0.20, y: fcy + fr * 1.22),
+                       controlPoint2: NSPoint(x: cx - fr * 0.72, y: fcy + fr * 1.22))
+            head.curve(to: NSPoint(x: cx - fr, y: fcy),
+                       controlPoint1: NSPoint(x: cx - fr * 0.88,   y: fcy + fr * 0.58),
+                       controlPoint2: NSPoint(x: cx - fr,           y: fcy + fr * 0.35))
+            head.curve(to: NSPoint(x: cx,      y: fcy - fr),
+                       controlPoint1: NSPoint(x: cx - fr,           y: fcy - fr * 0.552),
+                       controlPoint2: NSPoint(x: cx - fr * 0.552,   y: fcy - fr))
+            head.close()
+            strokeColor.setStroke()
+            head.stroke()
 
-            let bubble = NSBezierPath(
-                roundedRect: bubbleRect,
-                xRadius: bubbleRect.width * 0.26,
-                yRadius: bubbleRect.height * 0.26
-            )
-            bubble.fill()
+            let eyeR  = fr * 0.13
+            let eyeY  = fcy + fr * 0.12
+            let eyeOX = fr * 0.38
+            strokeColor.setFill()
+            NSBezierPath(ovalIn: NSRect(x: cx - eyeOX - eyeR, y: eyeY - eyeR,
+                                        width: eyeR * 2, height: eyeR * 2)).fill()
+            NSBezierPath(ovalIn: NSRect(x: cx + eyeOX - eyeR, y: eyeY - eyeR,
+                                        width: eyeR * 2, height: eyeR * 2)).fill()
 
-            let tail = NSBezierPath()
-            tail.move(to: NSPoint(x: bubbleRect.minX + bubbleRect.width * 0.2, y: bubbleRect.minY + bubbleRect.height * 0.08))
-            tail.line(to: NSPoint(x: bubbleRect.minX + bubbleRect.width * 0.05, y: bubbleRect.minY - gh * 0.04))
-            tail.line(to: NSPoint(x: bubbleRect.minX + bubbleRect.width * 0.3, y: bubbleRect.minY + bubbleRect.height * 0.02))
-            tail.close()
-            tail.fill()
-
-            ctx.saveGState()
-            ctx.setBlendMode(.clear)
-
-            let eyeWidth = gw * 0.095
-            let eyeHeight = gh * 0.14
-            let eyeY = gy + gh * 0.36
-            let eyeOffset = gw * 0.15
-            let leftEye = NSBezierPath(
-                roundedRect: NSRect(
-                    x: gx + gw * 0.5 - eyeOffset - eyeWidth * 0.5,
-                    y: eyeY,
-                    width: eyeWidth,
-                    height: eyeHeight
-                ),
-                xRadius: eyeWidth * 0.5,
-                yRadius: eyeHeight * 0.5
-            )
-            leftEye.fill()
-
-            let rightEye = NSBezierPath(
-                roundedRect: NSRect(
-                    x: gx + gw * 0.5 + eyeOffset - eyeWidth * 0.5,
-                    y: eyeY,
-                    width: eyeWidth,
-                    height: eyeHeight
-                ),
-                xRadius: eyeWidth * 0.5,
-                yRadius: eyeHeight * 0.5
-            )
-            rightEye.fill()
-
-            let nose = NSBezierPath()
-            nose.move(to: NSPoint(x: gx + gw * 0.5, y: gy + gh * 0.25))
-            nose.line(to: NSPoint(x: gx + gw * 0.448, y: gy + gh * 0.31))
-            nose.line(to: NSPoint(x: gx + gw * 0.552, y: gy + gh * 0.31))
+            let noseY = fcy - fr * 0.10
+            let ns    = fr * 0.10
+            let nose  = NSBezierPath()
+            nose.move(to: NSPoint(x: cx - ns, y: noseY + ns * 0.65))
+            nose.line(to: NSPoint(x: cx + ns, y: noseY + ns * 0.65))
+            nose.line(to: NSPoint(x: cx,      y: noseY - ns * 0.65))
             nose.close()
+            strokeColor.setFill()
             nose.fill()
-
-            ctx.restoreGState()
-
+            
             return true
         }
         image.size = NSSize(width: pointSize, height: pointSize)

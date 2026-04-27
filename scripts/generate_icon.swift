@@ -29,8 +29,8 @@ let tmp = FileManager.default.temporaryDirectory
 try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
 defer { try? FileManager.default.removeItem(at: tmp) }
 
-func drawGlyph(in rect: NSRect, fillColor: NSColor, cutoutEyes: Bool) {
-    guard let ctx = NSGraphicsContext.current?.cgContext else {
+func drawGlyph(in rect: NSRect, strokeColor: NSColor, strokeWidth: CGFloat) {
+    guard NSGraphicsContext.current?.cgContext != nil else {
         return
     }
 
@@ -38,167 +38,166 @@ func drawGlyph(in rect: NSRect, fillColor: NSColor, cutoutEyes: Bool) {
     let gh = rect.height
     let gx = rect.minX
     let gy = rect.minY
-    let bubbleRect = NSRect(
-        x: gx + gw * 0.08,
-        y: gy + gh * 0.10,
-        width: gw * 0.8,
-        height: gh * 0.62
-    )
 
-    fillColor.setFill()
+    // ── Cat face: line-art stroke style ──────────────────────────────────
+    let cx  = gx + gw * 0.50
+    let fr  = gw * 0.40        // face radius
+    let fcy = gy + gh * 0.40   // face centre Y
 
-    let leftEar = NSBezierPath()
-    leftEar.move(to: NSPoint(x: gx + gw * 0.24, y: gy + gh * 0.66))
-    leftEar.line(to: NSPoint(x: gx + gw * 0.36, y: gy + gh * 0.96))
-    leftEar.line(to: NSPoint(x: gx + gw * 0.48, y: gy + gh * 0.66))
-    leftEar.close()
-    leftEar.fill()
+    let head = NSBezierPath()
+    head.lineJoinStyle = .miter
+    head.lineCapStyle  = .round
+    head.lineWidth     = strokeWidth
 
-    let rightEar = NSBezierPath()
-    rightEar.move(to: NSPoint(x: gx + gw * 0.76, y: gy + gh * 0.66))
-    rightEar.line(to: NSPoint(x: gx + gw * 0.64, y: gy + gh * 0.96))
-    rightEar.line(to: NSPoint(x: gx + gw * 0.52, y: gy + gh * 0.66))
-    rightEar.close()
-    rightEar.fill()
+    // bottom → right quarter-circle
+    head.move(to: NSPoint(x: cx,       y: fcy - fr))
+    head.curve(to: NSPoint(x: cx + fr, y: fcy),
+               controlPoint1: NSPoint(x: cx + fr * 0.552, y: fcy - fr),
+               controlPoint2: NSPoint(x: cx + fr,         y: fcy - fr * 0.552))
+    // right side → right-ear outer-base
+    head.curve(to: NSPoint(x: cx + fr * 0.70, y: fcy + fr * 0.70),
+               controlPoint1: NSPoint(x: cx + fr,          y: fcy + fr * 0.35),
+               controlPoint2: NSPoint(x: cx + fr * 0.88,   y: fcy + fr * 0.58))
+    // right ear: outer-base → soft rounded arch → inner-base
+    head.curve(to: NSPoint(x: cx + fr * 0.22, y: fcy + fr * 0.88),
+               controlPoint1: NSPoint(x: cx + fr * 0.72, y: fcy + fr * 1.22),
+               controlPoint2: NSPoint(x: cx + fr * 0.20, y: fcy + fr * 1.22))
+    // forehead dip
+    head.curve(to: NSPoint(x: cx - fr * 0.22, y: fcy + fr * 0.88),
+               controlPoint1: NSPoint(x: cx + fr * 0.10, y: fcy + fr * 0.72),
+               controlPoint2: NSPoint(x: cx - fr * 0.10, y: fcy + fr * 0.72))
+    // left ear: inner-base → soft rounded arch → outer-base
+    head.curve(to: NSPoint(x: cx - fr * 0.70, y: fcy + fr * 0.70),
+               controlPoint1: NSPoint(x: cx - fr * 0.20, y: fcy + fr * 1.22),
+               controlPoint2: NSPoint(x: cx - fr * 0.72, y: fcy + fr * 1.22))
+    // left side → bottom
+    head.curve(to: NSPoint(x: cx - fr, y: fcy),
+               controlPoint1: NSPoint(x: cx - fr * 0.88,   y: fcy + fr * 0.58),
+               controlPoint2: NSPoint(x: cx - fr,           y: fcy + fr * 0.35))
+    head.curve(to: NSPoint(x: cx,      y: fcy - fr),
+               controlPoint1: NSPoint(x: cx - fr,           y: fcy - fr * 0.552),
+               controlPoint2: NSPoint(x: cx - fr * 0.552,   y: fcy - fr))
+    head.close()
+    strokeColor.setStroke()
+    head.stroke()
 
-    let bubble = NSBezierPath(
-        roundedRect: bubbleRect,
-        xRadius: bubbleRect.width * 0.26,
-        yRadius: bubbleRect.height * 0.26
-    )
-    bubble.fill()
+    // Eyes: filled circles
+    let eyeR  = fr * 0.13
+    let eyeY  = fcy + fr * 0.12
+    let eyeOX = fr * 0.38
+    strokeColor.setFill()
+    NSBezierPath(ovalIn: NSRect(x: cx - eyeOX - eyeR, y: eyeY - eyeR,
+                                width: eyeR * 2, height: eyeR * 2)).fill()
+    NSBezierPath(ovalIn: NSRect(x: cx + eyeOX - eyeR, y: eyeY - eyeR,
+                                width: eyeR * 2, height: eyeR * 2)).fill()
 
-    let tail = NSBezierPath()
-    tail.move(to: NSPoint(x: bubbleRect.minX + bubbleRect.width * 0.2, y: bubbleRect.minY + bubbleRect.height * 0.08))
-    tail.line(to: NSPoint(x: bubbleRect.minX + bubbleRect.width * 0.05, y: bubbleRect.minY - gh * 0.04))
-    tail.line(to: NSPoint(x: bubbleRect.minX + bubbleRect.width * 0.3, y: bubbleRect.minY + bubbleRect.height * 0.02))
-    tail.close()
-    tail.fill()
+    // Nose: small filled inverted triangle
+    let noseY = fcy - fr * 0.10
+    let ns    = fr * 0.10
+    let nose  = NSBezierPath()
+    nose.move(to: NSPoint(x: cx - ns, y: noseY + ns * 0.65))
+    nose.line(to: NSPoint(x: cx + ns, y: noseY + ns * 0.65))
+    nose.line(to: NSPoint(x: cx,      y: noseY - ns * 0.65))
+    nose.close()
+    nose.fill()
+}
 
-    guard cutoutEyes else {
+func drawBadge(in rect: NSRect) {
+    guard let cgContext = NSGraphicsContext.current?.cgContext else {
         return
     }
 
-    ctx.saveGState()
-    ctx.setBlendMode(.clear)
+    let radius = rect.width * 0.225
+    let badgePath = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
 
-    let eyeWidth = gw * 0.09
-    let eyeHeight = gh * 0.14
-    let eyeY = gy + gh * 0.36
-    let eyeOffset = gw * 0.15
-    let leftEye = NSBezierPath(
-        roundedRect: NSRect(
-            x: gx + gw * 0.5 - eyeOffset - eyeWidth * 0.5,
-            y: eyeY,
-            width: eyeWidth,
-            height: eyeHeight
-        ),
-        xRadius: eyeWidth * 0.5,
-        yRadius: eyeHeight * 0.5
+    cgContext.saveGState()
+    cgContext.setShadow(
+        offset: CGSize(width: 0, height: -rect.height * 0.016),
+        blur: rect.width * 0.028,
+        color: NSColor.black.withAlphaComponent(0.18).cgColor
     )
-    leftEye.fill()
+    NSColor(calibratedWhite: 0.98, alpha: 1.0).setFill()
+    badgePath.fill()
+    cgContext.restoreGState()
 
-    let rightEye = NSBezierPath(
-        roundedRect: NSRect(
-            x: gx + gw * 0.5 + eyeOffset - eyeWidth * 0.5,
-            y: eyeY,
-            width: eyeWidth,
-            height: eyeHeight
-        ),
-        xRadius: eyeWidth * 0.5,
-        yRadius: eyeHeight * 0.5
+    NSColor.black.withAlphaComponent(0.08).setStroke()
+    badgePath.lineWidth = max(1.0, rect.width * 0.006)
+    badgePath.stroke()
+}
+
+func makeBitmapRep(size: Int) -> NSBitmapImageRep? {
+    NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: size,
+        pixelsHigh: size,
+        bitsPerSample: 8,
+        samplesPerPixel: 4,
+        hasAlpha: true,
+        isPlanar: false,
+        colorSpaceName: .deviceRGB,
+        bytesPerRow: 0,
+        bitsPerPixel: 0
     )
-    rightEye.fill()
-
-    let nose = NSBezierPath()
-    nose.move(to: NSPoint(x: gx + gw * 0.5, y: gy + gh * 0.25))
-    nose.line(to: NSPoint(x: gx + gw * 0.448, y: gy + gh * 0.31))
-    nose.line(to: NSPoint(x: gx + gw * 0.552, y: gy + gh * 0.31))
-    nose.close()
-    nose.fill()
-
-    ctx.restoreGState()
 }
 
 func render(size: Int) -> Data? {
-    let dim = CGFloat(size)
-    let image = NSImage(size: NSSize(width: dim, height: dim), flipped: false) { rect in
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+    let supersample = size <= 64 ? 8 : 4
+    let workingSize = size * supersample
 
-        let cornerRadius = dim * 0.224
-        let bgPath = NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius)
-
-        ctx.saveGState()
-        bgPath.addClip()
-
-        let gradient = NSGradient(colors: [
-            NSColor(calibratedRed: 0.08, green: 0.10, blue: 0.14, alpha: 1.0),
-            NSColor(calibratedRed: 0.21, green: 0.24, blue: 0.30, alpha: 1.0),
-        ])
-        gradient?.draw(in: bgPath, angle: -72)
-
-        if let topGlow = NSGradient(colors: [
-            NSColor.white.withAlphaComponent(0.2),
-            NSColor.white.withAlphaComponent(0.0),
-        ]) {
-            let center = NSPoint(x: dim * 0.32, y: dim * 0.8)
-            topGlow.draw(fromCenter: center, radius: 0, toCenter: center, radius: dim * 0.58, options: [])
-        }
-
-        let innerPanel = NSBezierPath(
-            roundedRect: rect.insetBy(dx: dim * 0.11, dy: dim * 0.11),
-            xRadius: dim * 0.15,
-            yRadius: dim * 0.15
-        )
-        NSColor.white.withAlphaComponent(0.04).setFill()
-        innerPanel.fill()
-
-        let glyphRect = NSRect(
-            x: dim * 0.19,
-            y: dim * 0.16,
-            width: dim * 0.62,
-            height: dim * 0.68
-        )
-
-        ctx.saveGState()
-        ctx.setShadow(
-            offset: CGSize(width: 0, height: -dim * 0.018),
-            blur: dim * 0.05,
-            color: NSColor.black.withAlphaComponent(0.34).cgColor
-        )
-        drawGlyph(
-            in: glyphRect,
-            fillColor: NSColor(calibratedRed: 0.97, green: 0.95, blue: 0.91, alpha: 1.0),
-            cutoutEyes: dim >= 64
-        )
-        ctx.restoreGState()
-
-        if let accent = NSGradient(colors: [
-            NSColor(calibratedRed: 0.94, green: 0.62, blue: 0.31, alpha: 0.22),
-            NSColor(calibratedRed: 0.94, green: 0.62, blue: 0.31, alpha: 0.0),
-        ]) {
-            let center = NSPoint(x: dim * 0.74, y: dim * 0.32)
-            accent.draw(fromCenter: center, radius: 0, toCenter: center, radius: dim * 0.34, options: [])
-        }
-
-        ctx.restoreGState()
-
-        let stroke = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
-                                  xRadius: cornerRadius - 0.5,
-                                  yRadius: cornerRadius - 0.5)
-        NSColor.black.withAlphaComponent(0.08).setStroke()
-        stroke.lineWidth = 1.0
-        stroke.stroke()
-
-        return true
-    }
-
-    guard let tiff = image.tiffRepresentation,
-          let rep = NSBitmapImageRep(data: tiff),
-          let png = rep.representation(using: .png, properties: [:]) else {
+    guard let workingRep = makeBitmapRep(size: workingSize),
+          let workingContext = NSGraphicsContext(bitmapImageRep: workingRep) else {
         return nil
     }
-    return png
+
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = workingContext
+    defer { NSGraphicsContext.restoreGraphicsState() }
+
+    let workingCG = workingContext.cgContext
+
+    let workingDim = CGFloat(workingSize)
+    workingCG.setShouldAntialias(true)
+    workingCG.setAllowsAntialiasing(true)
+    workingCG.interpolationQuality = .high
+    workingCG.clear(CGRect(x: 0, y: 0, width: workingDim, height: workingDim))
+
+    let badgeInset = workingDim * 0.05
+    let badgeRect = NSRect(
+        x: badgeInset,
+        y: badgeInset,
+        width: workingDim - badgeInset * 2,
+        height: workingDim - badgeInset * 2
+    )
+    drawBadge(in: badgeRect)
+
+    let glyphRect = badgeRect.insetBy(dx: badgeRect.width * 0.16, dy: badgeRect.height * 0.06)
+
+    drawGlyph(
+        in: glyphRect,
+        strokeColor: NSColor.black,
+        strokeWidth: glyphRect.width * 0.105
+    )
+
+    guard let outputRep = makeBitmapRep(size: size),
+          let outputContext = NSGraphicsContext(bitmapImageRep: outputRep),
+          let workingImage = workingRep.cgImage else {
+        return nil
+    }
+
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = outputContext
+    defer { NSGraphicsContext.restoreGraphicsState() }
+
+    let outputCG = outputContext.cgContext
+
+    let outputDim = CGFloat(size)
+    outputCG.setShouldAntialias(true)
+    outputCG.setAllowsAntialiasing(true)
+    outputCG.interpolationQuality = .high
+    outputCG.clear(CGRect(x: 0, y: 0, width: outputDim, height: outputDim))
+    outputCG.draw(workingImage, in: CGRect(x: 0, y: 0, width: outputDim, height: outputDim))
+
+    return outputRep.representation(using: .png, properties: [:])
 }
 
 for (px, name) in sizes {

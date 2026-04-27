@@ -60,16 +60,18 @@ public struct ChatView: View {
 
             TextField(inputPlaceholderText, text: $viewModel.inputText, axis: .vertical)
                 .textFieldStyle(.plain)
-                .lineLimit(1 ... 6)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 11)
+                .font(.system(size: 15))
+                .lineLimit(1 ... 8)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
                 .background(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(Color(nsColor: .textBackgroundColor))
+                        .shadow(color: Color.black.opacity(0.03), radius: 3, x: 0, y: 1)
                 )
                 .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 1)
                 }
                 .disabled(sendDisabled)
 
@@ -109,28 +111,29 @@ public struct ChatView: View {
     }
 
     private var headerCard: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .center, spacing: 16) {
             ZStack {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .fill(
                         LinearGradient(
                             colors: currentConversationType == .group
-                                ? [Color.orange.opacity(0.9), Color.red.opacity(0.72)]
-                                : [Color.blue.opacity(0.92), Color.cyan.opacity(0.78)],
+                                ? [Color.orange.opacity(0.85), Color.red.opacity(0.7)]
+                                : [Color.blue.opacity(0.85), Color.cyan.opacity(0.65)],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
                     )
+                    .shadow(color: currentConversationType == .group ? Color.red.opacity(0.3) : Color.blue.opacity(0.3), radius: 6, x: 0, y: 3)
 
                 Image(systemName: currentConversationType == .group ? "person.3.fill" : "pawprint.fill")
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(.white)
             }
-            .frame(width: 44, height: 44)
+            .frame(width: 48, height: 48)
 
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 6) {
                 Text(currentConversationTitle)
-                    .font(.title3.weight(.semibold))
+                    .font(.title3.weight(.bold))
                     .lineLimit(1)
                 Text(currentConversationSubtitle)
                     .font(.subheadline)
@@ -142,11 +145,13 @@ public struct ChatView: View {
 
             aiStatusBadge
         }
-        .padding(16)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 16)
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .shadow(color: Color.black.opacity(0.04), radius: 8, x: 0, y: 4)
         .overlay {
             RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .stroke(Color.white.opacity(0.28), lineWidth: 1)
+                .stroke(Color.white.opacity(0.35), lineWidth: 1)
         }
     }
 
