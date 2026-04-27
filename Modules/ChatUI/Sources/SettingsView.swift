@@ -123,6 +123,32 @@ private enum PluginTemplateOption: String, CaseIterable, Identifiable {
     }
 }
 
+private enum SettingsScope: String, CaseIterable, Identifiable {
+    case all
+    case pet
+    case sprite
+    case awareness
+    case ai
+    case notifications
+    case plugins
+    case capability
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all: return "全部"
+        case .pet: return "宠物"
+        case .sprite: return "外观"
+        case .awareness: return "感知"
+        case .ai: return "AI"
+        case .notifications: return "通知"
+        case .plugins: return "插件"
+        case .capability: return "能力"
+        }
+    }
+}
+
 @MainActor
 public struct SettingsView: View {
     @State private var capabilityItems: [CapabilityItem]
@@ -153,6 +179,7 @@ public struct SettingsView: View {
     @State private var ollamaEndpoint: String
     @State private var aiBackend: AIEngine.AIBackend
     @State private var ollamaModel: String
+    @State private var openAIApiKey: String
     @State private var aiSystemPrompt: String
     @State private var memoryWorkerEnabled: Bool
     @State private var memoryWorkerEndpoint: String
@@ -192,6 +219,12 @@ public struct SettingsView: View {
     @State private var editingPluginID: String?
     @State private var showPluginDeleteConfirm = false
     @State private var pendingPluginDeleteID: String?
+    @State private var settingsScope: SettingsScope = .all
+    @State private var settingsSearchText: String = ""
+    @State private var pendingAIConfigSaveTask: Task<Void, Never>?
+    @State private var pendingAIMemorySaveTask: Task<Void, Never>?
+    @State private var pendingNotificationSaveTask: Task<Void, Never>?
+    @State private var pendingPetSoundSaveTask: Task<Void, Never>?
     private let onSaveWeatherLocation: @MainActor (Double?, Double?) -> Void
     private let onSetWeatherRefreshInterval: @MainActor (Double) -> Void
     private let spritePackItems: [SpritePackDisplayItem]
@@ -206,7 +239,7 @@ public struct SettingsView: View {
     private let onTestConnection: @MainActor () -> Void
     private let onTestAIMemoryConnection: @MainActor () async -> String?
     private let onTestAIMemoryWrite: @MainActor () async -> String?
-    private let onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend) -> Void
+    private let onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend, String) -> Void
     private let onSaveAIMemoryConfig: @MainActor (Bool, String, String, String, String, String, String, Int) -> Void
     private let onSaveNotificationConfig: @MainActor (String, Bool, Int, String) -> Void
     private let onUpdatePet: @MainActor (UUID, String, String, Double, String, String, String, String) -> Void
@@ -244,6 +277,7 @@ public struct SettingsView: View {
         ollamaEndpoint: String = "http://localhost:11434",
         aiBackend: AIEngine.AIBackend = .ollama,
         ollamaModel: String = "llama3.2",
+        openAIApiKey: String = "",
         aiSystemPrompt: String = "",
         memoryWorkerEnabled: Bool = false,
         memoryWorkerEndpoint: String = "https://memory.example.com",
@@ -262,7 +296,7 @@ public struct SettingsView: View {
         onTestConnection: @escaping @MainActor () -> Void = {},
         onTestAIMemoryConnection: @escaping @MainActor () async -> String? = { nil },
         onTestAIMemoryWrite: @escaping @MainActor () async -> String? = { nil },
-        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend) -> Void = { _, _, _, _ in },
+        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend, String) -> Void = { _, _, _, _, _ in },
         onSaveAIMemoryConfig: @escaping @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = { _, _, _, _, _, _, _, _ in },
         onSaveNotificationConfig: @escaping @MainActor (String, Bool, Int, String) -> Void = { _, _, _, _ in },
         onUpdatePet: @escaping @MainActor (UUID, String, String, Double, String, String, String, String) -> Void = { _, _, _, _, _, _, _, _ in },
@@ -302,6 +336,7 @@ public struct SettingsView: View {
         _ollamaEndpoint = State(initialValue: ollamaEndpoint)
         _aiBackend = State(initialValue: aiBackend)
         _ollamaModel = State(initialValue: ollamaModel)
+        _openAIApiKey = State(initialValue: openAIApiKey)
         _aiSystemPrompt = State(initialValue: aiSystemPrompt)
         _memoryWorkerEnabled = State(initialValue: memoryWorkerEnabled)
         _memoryWorkerEndpoint = State(initialValue: memoryWorkerEndpoint)
@@ -377,14 +412,40 @@ public struct SettingsView: View {
     }
 
     public var body: some View {
+        NavigationStack {
+            settingsList
+        }
+    }
+
+    private var settingsList: some View {
         List {
+            Section("显示范围") {
+                Picker("模块", selection: $settingsScope) {
+                    ForEach(SettingsScope.allCases) { scope in
+                        Text(scope.title).tag(scope)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+
             // ─── 宠物核心 ───
-            Section(L10n.settingsPetManagement) {
-                ForEach(petProfiles) { pet in
+            if shouldShowSection(.pet) {
+                let visiblePets = petProfiles.filter { pet in
+                    editingPetID == pet.id
+                        || matchesSearchText(pet.name, spritePackName(for: pet.spritePack), pet.personality, pet.hobbies)
+                }
+
+                Section(L10n.settingsPetManagement) {
+                    if visiblePets.isEmpty {
+                        Text(searchKeyword.isEmpty ? "暂无宠物" : "没有匹配的宠物")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    ForEach(visiblePets) { pet in
                     if editingPetID == pet.id {
                         VStack(alignment: .leading, spacing: 12) {
-                            // ── 基础属性（始终展示） ──
-                            VStack(alignment: .leading, spacing: 8) {
+                            collapsibleSection("基础属性", icon: "slider.horizontal.3", isExpanded: $editBasicExpanded) {
                                 HStack {
                                     Text(L10n.settingsPetManagementName)
                                         .frame(width: 50, alignment: .leading)
@@ -470,18 +531,14 @@ public struct SettingsView: View {
                             // ── 音效设置（可折叠，即时保存） ──
                             collapsibleSection("音效设置", icon: "speaker.wave.2", isExpanded: $editSoundExpanded) {
                                 Toggle("独立设置（不跟随全局）", isOn: $editUsesCustomSound)
-                                    .onChange(of: editUsesCustomSound) { _, newValue in
-                                        onUpdatePetSound(
-                                            pet.id,
-                                            newValue ? editSoundEnabled : nil,
-                                            newValue ? Float(editSoundVolume) : nil
-                                        )
+                                    .onChange(of: editUsesCustomSound) { _, _ in
+                                        schedulePetSoundSave(for: pet.id, immediate: true)
                                     }
 
                                 if editUsesCustomSound {
                                     Toggle("启用音效", isOn: $editSoundEnabled)
                                         .onChange(of: editSoundEnabled) { _, _ in
-                                            onUpdatePetSound(pet.id, editSoundEnabled, Float(editSoundVolume))
+                                            schedulePetSoundSave(for: pet.id, immediate: true)
                                         }
 
                                     HStack {
@@ -490,7 +547,7 @@ public struct SettingsView: View {
                                         Slider(value: $editSoundVolume, in: 0...1)
                                             .disabled(!editSoundEnabled)
                                             .onChange(of: editSoundVolume) { _, _ in
-                                                onUpdatePetSound(pet.id, editSoundEnabled, Float(editSoundVolume))
+                                                schedulePetSoundSave(for: pet.id)
                                             }
                                         Text("\(Int(editSoundVolume * 100))%")
                                             .font(.caption)
@@ -505,37 +562,43 @@ public struct SettingsView: View {
                                 }
                             }
 
+                            collapsibleSection("重置选项", icon: "arrow.counterclockwise", isExpanded: $editResetExpanded) {
+                                HStack(spacing: 10) {
+                                    Button("还原语言") {
+                                        pendingResetPetID = pet.id
+                                        showResetLanguageConfirm = true
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(pet.customLanguage == nil)
+
+                                    Button("还原属性") {
+                                        pendingResetPetID = pet.id
+                                        showResetAttributesConfirm = true
+                                    }
+                                    .buttonStyle(.bordered)
+
+                                    Button("全部还原") {
+                                        pendingResetPetID = pet.id
+                                        showResetAllConfirm = true
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .tint(.red)
+                                }
+                            }
+
                             Divider()
 
-                            // ── 操作按钮 ──
                             HStack(spacing: 12) {
-                                Button("还原语言") {
-                                    pendingResetPetID = pet.id
-                                    showResetLanguageConfirm = true
-                                }
-                                .buttonStyle(.borderless)
-                                .disabled(pet.customLanguage == nil)
-
-                                Button("还原属性") {
-                                    pendingResetPetID = pet.id
-                                    showResetAttributesConfirm = true
-                                }
-                                .buttonStyle(.borderless)
-
-                                Button("全部还原") {
-                                    pendingResetPetID = pet.id
-                                    showResetAllConfirm = true
-                                }
-                                .buttonStyle(.borderless)
-                                .foregroundStyle(.red)
-
-                                Spacer()
-
                                 Button(L10n.settingsPetManagementCancel) {
+                                    pendingPetSoundSaveTask?.cancel()
                                     editingPetID = nil
                                 }
                                 .buttonStyle(.borderless)
+
+                                Spacer()
+
                                 Button {
+                                    pendingPetSoundSaveTask?.cancel()
                                     let normalizedName = normalizedPetName(editName, fallback: pet.name)
                                     onUpdatePet(
                                         pet.id,
@@ -605,108 +668,117 @@ public struct SettingsView: View {
                     }
                 }
 
-                if canAddMorePets {
-                    Button(L10n.settingsPetManagementAdd) {
-                        onAddPet()
-                        petProfiles = loadPetProfiles()
-                    }
-                } else {
-                    Text(L10n.settingsPetManagementMaxReached)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .alert(L10n.settingsPetManagementDeleteConfirm, isPresented: $showRemoveConfirm) {
-                Button(L10n.settingsPetManagementDelete, role: .destructive) {
-                    let idToRemove = pendingRemoveID
-                    pendingRemoveID = nil
-                    if let id = idToRemove {
-                        onRemovePet(id)
-                        if editingPetID == id {
-                            editingPetID = nil
-                        }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    if canAddMorePets {
+                        Button(L10n.settingsPetManagementAdd) {
+                            onAddPet()
                             petProfiles = loadPetProfiles()
                         }
+                    } else {
+                        Text(L10n.settingsPetManagementMaxReached)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
-                Button(L10n.settingsPetManagementCancel, role: .cancel) {
-                    pendingRemoveID = nil
-                }
-            }
-            .alert("确定还原语言设置？", isPresented: $showResetLanguageConfirm) {
-                Button("还原", role: .destructive) {
-                    if let id = pendingResetPetID {
-                        onResetLanguage?(id)
-                        refreshPetProfiles(reloadEditingPetID: id)
-                    }
-                    pendingResetPetID = nil
-                }
-                Button("取消", role: .cancel) {
-                    pendingResetPetID = nil
-                }
-            }
-            .alert("确定还原所有属性到默认？", isPresented: $showResetAttributesConfirm) {
-                Button("还原", role: .destructive) {
-                    if let id = pendingResetPetID {
-                        onResetAttributes?(id)
-                        refreshPetProfiles(reloadEditingPetID: id)
-                    }
-                    pendingResetPetID = nil
-                }
-                Button("取消", role: .cancel) {
-                    pendingResetPetID = nil
-                }
-            }
-            .alert("确定还原所有设置到默认？这将清除语言、音效、属性的所有自定义。", isPresented: $showResetAllConfirm) {
-                Button("全部还原", role: .destructive) {
-                    if let id = pendingResetPetID {
-                        onResetAll?(id)
-                        refreshPetProfiles(reloadEditingPetID: id)
-                    }
-                    pendingResetPetID = nil
-                }
-                Button("取消", role: .cancel) {
-                    pendingResetPetID = nil
-                }
-            }
-
-            Section(L10n.settingsSpritePacks) {
-                if spritePackItems.isEmpty {
-                    Text(L10n.settingsNoSpritePacks)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .padding(.vertical, 6)
-                } else {
-                    ForEach(spritePackItems) { item in
-                        spritePackRow(for: item)
-                    }
-                }
-
-                HStack(spacing: 12) {
-                    Button(L10n.settingsSpritePacksImport) {
-                        Task {
-                            if let error = await onImportPack() {
-                                errorMessage = error
-                                showError = true
+                .alert(L10n.settingsPetManagementDeleteConfirm, isPresented: $showRemoveConfirm) {
+                    Button(L10n.settingsPetManagementDelete, role: .destructive) {
+                        let idToRemove = pendingRemoveID
+                        pendingRemoveID = nil
+                        if let id = idToRemove {
+                            onRemovePet(id)
+                            if editingPetID == id {
+                                editingPetID = nil
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                petProfiles = loadPetProfiles()
                             }
                         }
                     }
 
-                    Button(L10n.settingsSpritePacksCreateTemplate) {
-                        Task {
-                            if let error = await onCreateTemplate() {
-                                errorMessage = error
-                                showError = true
+                    Button(L10n.settingsPetManagementCancel, role: .cancel) {
+                        pendingRemoveID = nil
+                    }
+                }
+                .alert("确定还原语言设置？", isPresented: $showResetLanguageConfirm) {
+                    Button("还原", role: .destructive) {
+                        if let id = pendingResetPetID {
+                            onResetLanguage?(id)
+                            refreshPetProfiles(reloadEditingPetID: id)
+                        }
+                        pendingResetPetID = nil
+                    }
+                    Button("取消", role: .cancel) {
+                        pendingResetPetID = nil
+                    }
+                }
+                .alert("确定还原所有属性到默认？", isPresented: $showResetAttributesConfirm) {
+                    Button("还原", role: .destructive) {
+                        if let id = pendingResetPetID {
+                            onResetAttributes?(id)
+                            refreshPetProfiles(reloadEditingPetID: id)
+                        }
+                        pendingResetPetID = nil
+                    }
+                    Button("取消", role: .cancel) {
+                        pendingResetPetID = nil
+                    }
+                }
+                .alert("确定还原所有设置到默认？这将清除语言、音效、属性的所有自定义。", isPresented: $showResetAllConfirm) {
+                    Button("全部还原", role: .destructive) {
+                        if let id = pendingResetPetID {
+                            onResetAll?(id)
+                            refreshPetProfiles(reloadEditingPetID: id)
+                        }
+                        pendingResetPetID = nil
+                    }
+                    Button("取消", role: .cancel) {
+                        pendingResetPetID = nil
+                    }
+                }
+            }
+
+            if shouldShowSection(.sprite) {
+                let visibleSpritePackItems = spritePackItems.filter { item in
+                    matchesSearchText(item.name, item.id)
+                }
+
+                Section(L10n.settingsSpritePacks) {
+                    if visibleSpritePackItems.isEmpty {
+                        Text(spritePackItems.isEmpty ? L10n.settingsNoSpritePacks : "没有匹配的外观包")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 6)
+                    } else {
+                        ForEach(visibleSpritePackItems) { item in
+                            spritePackRow(for: item)
+                        }
+                    }
+
+                    HStack(spacing: 12) {
+                        Button(L10n.settingsSpritePacksImport) {
+                            Task {
+                                if let error = await onImportPack() {
+                                    errorMessage = error
+                                    showError = true
+                                }
+                            }
+                        }
+
+                        Button(L10n.settingsSpritePacksCreateTemplate) {
+                            Task {
+                                if let error = await onCreateTemplate() {
+                                    errorMessage = error
+                                    showError = true
+                                }
                             }
                         }
                     }
+                    .padding(.top, 4)
                 }
-                .padding(.top, 4)
             }
 
             // ─── 环境感知 ───
-            Section("桌面感知") {
+            if shouldShowSection(.awareness) {
+                Section("桌面感知") {
                 Toggle("启用桌面感知", isOn: $desktopAwarenessEnabled)
                     .onChange(of: desktopAwarenessEnabled) { _, newValue in
                         onSetDesktopAwarenessEnabled(newValue)
@@ -766,8 +838,10 @@ public struct SettingsView: View {
                 }
                 .padding(.top, 4)
             }
+            }
 
-            Section("天气感知") {
+            if shouldShowSection(.awareness) {
+                Section("天气感知") {
                 Toggle("启用天气感知", isOn: $weatherAwarenessEnabled)
                     .onChange(of: weatherAwarenessEnabled) { _, newValue in
                         onSetWeatherAwarenessEnabled(newValue)
@@ -835,8 +909,10 @@ public struct SettingsView: View {
                     }
                 }
             }
+            }
 
-            Section("音效") {
+            if shouldShowSection(.awareness) {
+                Section("音效") {
                 Toggle("启用音效", isOn: $soundEnabled)
                     .onChange(of: soundEnabled) { _, newValue in
                         onSetSoundEnabled(newValue)
@@ -856,214 +932,264 @@ public struct SettingsView: View {
                     }
                 }
             }
+            }
 
             // ─── AI & 通信 ───
-            Section(L10n.settingsAI) {
-                HStack(alignment: .center, spacing: 12) {
-                    Circle()
-                        .fill(statusColor(for: liveAIStatus))
-                        .frame(width: 10, height: 10)
-
-                    Text(aiStatusText)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.bottom, 2)
-
-                Picker(L10n.settingsAIBackend, selection: $aiBackend) {
-                    ForEach(AIEngine.AIBackend.allCases, id: \.self) { backend in
-                        Text(aiBackendTitle(backend)).tag(backend)
-                    }
-                }
-                .onChange(of: aiBackend) { oldValue, newValue in
-                    let trimmedModel = ollamaModel.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmedModel.isEmpty || trimmedModel == oldValue.defaultModel {
-                        ollamaModel = newValue.defaultModel
-                    }
-                    onSaveAIConfig(ollamaEndpoint, ollamaModel, aiSystemPrompt, newValue)
-                }
-
-                TextField(L10n.settingsAIEndpoint, text: $ollamaEndpoint)
-                    .textFieldStyle(.roundedBorder)
-                    .onChange(of: ollamaEndpoint) { _, newValue in
-                        onSaveAIConfig(newValue, ollamaModel, aiSystemPrompt, aiBackend)
-                    }
-
-                TextField(L10n.settingsAIModel, text: $ollamaModel)
-                    .textFieldStyle(.roundedBorder)
-                    .onChange(of: ollamaModel) { _, newValue in
-                        onSaveAIConfig(ollamaEndpoint, newValue, aiSystemPrompt, aiBackend)
-                    }
-
-                Text(L10n.settingsAISystemPrompt)
-                    .font(.headline)
-
-                ZStack(alignment: .topLeading) {
-                    if aiSystemPrompt.isEmpty {
-                        Text(L10n.settingsAISystemPromptPlaceholder)
-                            .font(.body)
+            if shouldShowSection(.ai) {
+                Section {
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(statusColor(for: liveAIStatus))
+                            .frame(width: 10, height: 10)
+                        Text(aiStatusText)
+                            .font(.subheadline)
                             .foregroundStyle(.secondary)
-                            .padding(.top, 8)
-                            .padding(.leading, 6)
-                            .padding(.trailing, 6)
+                        Spacer()
+                        Button(L10n.settingsAITestConnection) {
+                            liveAIStatus = .connecting
+                            onTestConnection()
+
+                            Task { @MainActor in
+                                for _ in 0..<60 {
+                                    try? await Task.sleep(for: .seconds(1))
+                                    let status = aiStatusProvider()
+                                    liveAIStatus = status
+                                    if case .connecting = status {
+                                        continue
+                                    }
+                                    break
+                                }
+                            }
+                        }
+                        .buttonStyle(.bordered)
                     }
 
-                    TextEditor(text: $aiSystemPrompt)
-                        .font(.body)
-                        .frame(minHeight: 96)
-                        .onChange(of: aiSystemPrompt) { _, newValue in
-                            onSaveAIConfig(ollamaEndpoint, ollamaModel, newValue, aiBackend)
+                    Picker(L10n.settingsAIBackend, selection: $aiBackend) {
+                        ForEach(AIEngine.AIBackend.allCases, id: \.self) { backend in
+                            Text(aiBackendTitle(backend)).tag(backend)
                         }
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color.secondary.opacity(0.35))
-                        )
-                }
-
-                Divider()
-                    .padding(.vertical, 2)
-
-                Text("远程记忆服务")
-                    .font(.headline)
-
-                Toggle("启用远程记忆服务", isOn: $memoryWorkerEnabled)
-                    .onChange(of: memoryWorkerEnabled) { _, _ in
-                        saveAIMemoryConfig()
+                    }
+                    .onChange(of: aiBackend) { oldValue, newValue in
+                        let trimmedModel = ollamaModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if trimmedModel.isEmpty || trimmedModel == oldValue.defaultModel {
+                            ollamaModel = newValue.defaultModel
+                        }
+                        scheduleAIConfigSave(immediate: true)
                     }
 
-                TextField("Memory API 地址", text: $memoryWorkerEndpoint)
-                    .textFieldStyle(.roundedBorder)
-                    .onChange(of: memoryWorkerEndpoint) { _, _ in
-                        saveAIMemoryConfig()
+                    LabeledContent(L10n.settingsAIEndpoint) {
+                        TextField(aiEndpointPlaceholder, text: $ollamaEndpoint)
+                            .textFieldStyle(.roundedBorder)
+                            .onChange(of: ollamaEndpoint) { _, _ in
+                                scheduleAIConfigSave()
+                            }
                     }
 
-                Picker("鉴权方式", selection: $memoryWorkerAuthMode) {
-                    Text("Basic").tag("basic")
-                    Text("Bearer").tag("bearer")
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: memoryWorkerAuthMode) { _, _ in
-                    saveAIMemoryConfig()
-                }
-
-                if memoryWorkerAuthMode == "bearer" {
-                    SecureField("Bearer Token", text: $memoryWorkerSecret)
-                        .textFieldStyle(.roundedBorder)
-                        .onChange(of: memoryWorkerSecret) { _, _ in
-                            saveAIMemoryConfig()
-                        }
-                } else {
-                    TextField("用户名", text: $memoryWorkerUsername)
-                        .textFieldStyle(.roundedBorder)
-                        .onChange(of: memoryWorkerUsername) { _, _ in
-                            saveAIMemoryConfig()
-                        }
-
-                    SecureField("密码 / API Secret", text: $memoryWorkerSecret)
-                        .textFieldStyle(.roundedBorder)
-                        .onChange(of: memoryWorkerSecret) { _, _ in
-                            saveAIMemoryConfig()
-                        }
-                }
-
-                TextField("记忆 Subject（用户 ID）", text: $memoryWorkerSubject)
-                    .textFieldStyle(.roundedBorder)
-                    .onChange(of: memoryWorkerSubject) { _, _ in
-                        saveAIMemoryConfig()
+                    LabeledContent(L10n.settingsAIModel) {
+                        TextField(aiBackend.defaultModel, text: $ollamaModel)
+                            .textFieldStyle(.roundedBorder)
+                            .onChange(of: ollamaModel) { _, _ in
+                                scheduleAIConfigSave()
+                            }
                     }
 
-                TextField("Scope", text: $memoryWorkerScope)
-                    .textFieldStyle(.roundedBorder)
-                    .onChange(of: memoryWorkerScope) { _, _ in
-                        saveAIMemoryConfig()
+                    if aiBackend == .openAICompatible {
+                        LabeledContent("API 密钥") {
+                            SecureField("sk-…（可留空，本地网关无需鉴权）", text: $openAIApiKey)
+                                .textFieldStyle(.roundedBorder)
+                                .onChange(of: openAIApiKey) { _, _ in
+                                    scheduleAIConfigSave()
+                                }
+                        }
                     }
 
-                HStack {
-                    Text("Query Limit")
-                    TextField("5", value: $memoryWorkerQueryLimit, format: .number)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 80)
-                        .onChange(of: memoryWorkerQueryLimit) { _, _ in
-                            saveAIMemoryConfig()
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(L10n.settingsAISystemPrompt)
+                            .font(.subheadline.weight(.medium))
+                        ZStack(alignment: .topLeading) {
+                            if aiSystemPrompt.isEmpty {
+                                Text(L10n.settingsAISystemPromptPlaceholder)
+                                    .font(.body)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.top, 8)
+                                    .padding(.leading, 6)
+                                    .padding(.trailing, 6)
+                            }
+
+                            TextEditor(text: $aiSystemPrompt)
+                                .font(.body)
+                                .frame(minHeight: 96)
+                                .onChange(of: aiSystemPrompt) { _, _ in
+                                    scheduleAIConfigSave()
+                                }
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(Color.secondary.opacity(0.35))
+                                )
                         }
-                    Text("(1-100)")
+                    }
+                } header: {
+                    Text(L10n.settingsAI)
+                } footer: {
+                    Text("配置宠物对话使用的本地或远程大模型服务。OpenAI 方式走标准 Chat Completions；API 密钥将使用 Bearer 鉴权，留空则不发送 Authorization（适合本地代理）。修改会自动保存。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            }
 
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 10) {
-                        Button("测试查询（读）") {
-                            Task { @MainActor in
-                                memoryWorkerConnectionMessage = "测试中..."
-                                memoryWorkerConnectionFailed = false
+            if shouldShowSection(.ai) {
+                Section {
+                    Toggle("启用远程记忆", isOn: $memoryWorkerEnabled)
+                        .onChange(of: memoryWorkerEnabled) { _, _ in
+                            saveAIMemoryConfig(immediate: true)
+                        }
 
-                                if let error = await onTestAIMemoryConnection(),
-                                   !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                    memoryWorkerConnectionMessage = "查询失败：\(error)"
-                                    memoryWorkerConnectionFailed = true
-                                } else {
-                                    memoryWorkerConnectionMessage = "查询成功"
-                                    memoryWorkerConnectionFailed = false
+                    Group {
+                        LabeledContent("服务地址") {
+                            TextField("https://memory.example.com", text: $memoryWorkerEndpoint)
+                                .textFieldStyle(.roundedBorder)
+                                .onChange(of: memoryWorkerEndpoint) { _, _ in
+                                    saveAIMemoryConfig()
                                 }
+                        }
+
+                        LabeledContent("鉴权方式") {
+                            Picker("", selection: $memoryWorkerAuthMode) {
+                                Text("Basic").tag("basic")
+                                Text("Bearer").tag("bearer")
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 200)
+                            .onChange(of: memoryWorkerAuthMode) { _, _ in
+                                saveAIMemoryConfig(immediate: true)
                             }
                         }
-                        .buttonStyle(.bordered)
 
-                        if let memoryWorkerConnectionMessage {
-                            Text(memoryWorkerConnectionMessage)
-                                .font(.caption)
-                                .foregroundStyle(memoryWorkerConnectionFailed ? .red : .green)
-                                .lineLimit(2)
+                        if memoryWorkerAuthMode == "bearer" {
+                            LabeledContent("Bearer 令牌") {
+                                SecureField("Token", text: $memoryWorkerSecret)
+                                    .textFieldStyle(.roundedBorder)
+                                    .onChange(of: memoryWorkerSecret) { _, _ in
+                                        saveAIMemoryConfig()
+                                    }
+                            }
+                        } else {
+                            LabeledContent("用户名") {
+                                TextField("username", text: $memoryWorkerUsername)
+                                    .textFieldStyle(.roundedBorder)
+                                    .onChange(of: memoryWorkerUsername) { _, _ in
+                                        saveAIMemoryConfig()
+                                    }
+                            }
+
+                            LabeledContent("密码") {
+                                SecureField("password", text: $memoryWorkerSecret)
+                                    .textFieldStyle(.roundedBorder)
+                                    .onChange(of: memoryWorkerSecret) { _, _ in
+                                        saveAIMemoryConfig()
+                                    }
+                            }
                         }
-                    }
 
-                    HStack(spacing: 10) {
-                        Button("测试写入一条记忆") {
-                            Task { @MainActor in
-                                memoryWorkerWriteMessage = "写入中..."
-                                memoryWorkerWriteFailed = false
-
-                                if let error = await onTestAIMemoryWrite(),
-                                   !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                    memoryWorkerWriteMessage = "写入失败：\(error)"
-                                    memoryWorkerWriteFailed = true
-                                } else {
-                                    memoryWorkerWriteMessage = "写入成功（服务端应新增一条测试记忆）"
-                                    memoryWorkerWriteFailed = false
+                        LabeledContent("用户标识 (Subject)") {
+                            TextField("默认使用当前设备", text: $memoryWorkerSubject)
+                                .textFieldStyle(.roundedBorder)
+                                .onChange(of: memoryWorkerSubject) { _, _ in
+                                    saveAIMemoryConfig()
                                 }
+                        }
+
+                        LabeledContent("命名空间 (Scope)") {
+                            TextField("user", text: $memoryWorkerScope)
+                                .textFieldStyle(.roundedBorder)
+                                .onChange(of: memoryWorkerScope) { _, _ in
+                                    saveAIMemoryConfig()
+                                }
+                        }
+
+                        LabeledContent("每次召回条数") {
+                            HStack(spacing: 8) {
+                                TextField("5", value: $memoryWorkerQueryLimit, format: .number)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 64)
+                                    .onChange(of: memoryWorkerQueryLimit) { _, _ in
+                                        saveAIMemoryConfig()
+                                    }
+                                Text("条（1–100）")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
                             }
                         }
-                        .buttonStyle(.bordered)
 
-                        if let memoryWorkerWriteMessage {
-                            Text(memoryWorkerWriteMessage)
-                                .font(.caption)
-                                .foregroundStyle(memoryWorkerWriteFailed ? .red : .green)
-                                .lineLimit(3)
-                        }
-                    }
-                }
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 10) {
+                                Button("测试读取") {
+                                    Task { @MainActor in
+                                        memoryWorkerConnectionMessage = "查询中…"
+                                        memoryWorkerConnectionFailed = false
 
-                Button(L10n.settingsAITestConnection) {
-                    liveAIStatus = .connecting
-                    onTestConnection()
+                                        if let error = await onTestAIMemoryConnection(),
+                                           !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                            memoryWorkerConnectionMessage = "失败：\(error)"
+                                            memoryWorkerConnectionFailed = true
+                                        } else {
+                                            memoryWorkerConnectionMessage = "成功"
+                                            memoryWorkerConnectionFailed = false
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.bordered)
 
-                    Task { @MainActor in
-                        for _ in 0..<60 {
-                            try? await Task.sleep(for: .seconds(1))
-                            let status = aiStatusProvider()
-                            liveAIStatus = status
-                            if case .connecting = status {
-                                continue
+                                Button("测试写入") {
+                                    Task { @MainActor in
+                                        memoryWorkerWriteMessage = "写入中…"
+                                        memoryWorkerWriteFailed = false
+
+                                        if let error = await onTestAIMemoryWrite(),
+                                           !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                            memoryWorkerWriteMessage = "失败：\(error)"
+                                            memoryWorkerWriteFailed = true
+                                        } else {
+                                            memoryWorkerWriteMessage = "成功"
+                                            memoryWorkerWriteFailed = false
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+
+                                Spacer()
                             }
-                            break
+
+                            if let memoryWorkerConnectionMessage {
+                                Text("读取：\(memoryWorkerConnectionMessage)")
+                                    .font(.caption)
+                                    .foregroundStyle(memoryWorkerConnectionFailed ? .red : .green)
+                                    .lineLimit(2)
+                            }
+
+                            if let memoryWorkerWriteMessage {
+                                Text("写入：\(memoryWorkerWriteMessage)")
+                                    .font(.caption)
+                                    .foregroundStyle(memoryWorkerWriteFailed ? .red : .green)
+                                    .lineLimit(2)
+                            }
                         }
                     }
+                    .disabled(!memoryWorkerEnabled)
+                    .opacity(memoryWorkerEnabled ? 1 : 0.45)
+                } header: {
+                    Text("远程记忆")
+                } footer: {
+                    Text("把宠物的长期记忆同步到远程 Worker，实现多设备共享。服务端需实现 /memory/query 与 /memory/write 接口。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
 
-            Section(L10n.settingsNotifications) {
+            if shouldShowSection(.notifications) {
+                Section(L10n.settingsNotifications) {
                 Text(L10n.settingsNotificationsGithub)
                     .font(.headline)
 
@@ -1073,16 +1199,16 @@ public struct SettingsView: View {
 
                 SecureField(L10n.settingsNotificationsGithubTokenPlaceholder, text: $githubToken)
                     .textFieldStyle(.roundedBorder)
-                    .onChange(of: githubToken) { _, newValue in
-                        onSaveNotificationConfig(newValue, webhookEnabled, webhookPort, webhookSecret)
+                    .onChange(of: githubToken) { _, _ in
+                        scheduleNotificationConfigSave()
                     }
 
                 Text(L10n.settingsNotificationsWebhook)
                     .font(.headline)
 
                 Toggle(L10n.settingsNotificationsWebhookEnabled, isOn: $webhookEnabled)
-                    .onChange(of: webhookEnabled) { _, newValue in
-                        onSaveNotificationConfig(githubToken, newValue, webhookPort, webhookSecret)
+                    .onChange(of: webhookEnabled) { _, _ in
+                        scheduleNotificationConfigSave(immediate: true)
                     }
 
                 if webhookEnabled {
@@ -1092,15 +1218,15 @@ public struct SettingsView: View {
                         TextField("19280", value: $webhookPort, format: .number)
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 80)
-                            .onChange(of: webhookPort) { _, newValue in
-                                onSaveNotificationConfig(githubToken, webhookEnabled, newValue, webhookSecret)
+                            .onChange(of: webhookPort) { _, _ in
+                                scheduleNotificationConfigSave()
                             }
                     }
 
                     SecureField("Webhook Secret (可选)", text: $webhookSecret)
                         .textFieldStyle(.roundedBorder)
-                        .onChange(of: webhookSecret) { _, newValue in
-                            onSaveNotificationConfig(githubToken, webhookEnabled, webhookPort, newValue)
+                        .onChange(of: webhookSecret) { _, _ in
+                            scheduleNotificationConfigSave()
                         }
 
                     Text(String(format: L10n.settingsNotificationsWebhookHint, webhookPort))
@@ -1108,9 +1234,15 @@ public struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            }
 
             // ─── 扩展 ───
-            Section(L10n.settingsPlugins) {
+            if shouldShowSection(.plugins) {
+                let visiblePlugins = pluginSettingsViewModel.plugins.filter { plugin in
+                    matchesSearchText(plugin.name, plugin.description, plugin.id)
+                }
+
+                Section(L10n.settingsPlugins) {
                 HStack {
                     Text("创建自己的 JSON 插件模板")
                         .font(.subheadline)
@@ -1127,13 +1259,23 @@ public struct SettingsView: View {
                 }
                 .padding(.vertical, 4)
 
-                if pluginSettingsViewModel.plugins.isEmpty {
-                    Text(L10n.settingsNoPlugins)
+                if !searchKeyword.isEmpty {
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                        Text("筛选关键词：\(searchKeyword)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if visiblePlugins.isEmpty {
+                    Text(pluginSettingsViewModel.plugins.isEmpty ? L10n.settingsNoPlugins : "没有匹配的插件")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 6)
                 } else {
-                    ForEach(pluginSettingsViewModel.plugins) { plugin in
+                    ForEach(visiblePlugins) { plugin in
                         let isEditingPlugin = editingPluginID == plugin.id
 
                         VStack(alignment: .leading, spacing: 10) {
@@ -1213,9 +1355,25 @@ public struct SettingsView: View {
                     }
                 }
             }
+            }
 
-            Section(L10n.settingsCapabilities) {
-                ForEach($capabilityItems) { $item in
+            if shouldShowSection(.capability) {
+                let visibleCapabilityIndices = capabilityItems.indices.filter { index in
+                    let item = capabilityItems[index]
+                    return matchesSearchText(item.name, item.description)
+                }
+
+                Section(L10n.settingsCapabilities) {
+                    if visibleCapabilityIndices.isEmpty {
+                        Text(searchKeyword.isEmpty ? "暂无能力项" : "没有匹配的能力项")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 6)
+                    }
+
+                    ForEach(visibleCapabilityIndices, id: \.self) { index in
+                        let itemBinding = $capabilityItems[index]
+                        let item = itemBinding.wrappedValue
                     HStack(alignment: .center, spacing: 14) {
                         Circle()
                             .fill(statusColor(for: item.status))
@@ -1232,17 +1390,19 @@ public struct SettingsView: View {
 
                         Spacer()
 
-                        Toggle("", isOn: $item.isEnabled)
+                        Toggle("", isOn: itemBinding.isEnabled)
                             .labelsHidden()
-                            .onChange(of: item.isEnabled) { _, newValue in
-                                item.status = newValue ? .active : .inactive
+                            .onChange(of: itemBinding.wrappedValue.isEnabled) { _, newValue in
+                                itemBinding.status.wrappedValue = newValue ? .active : .inactive
                             }
                     }
                     .padding(.vertical, 6)
                 }
             }
+            }
         }
         .listStyle(.inset)
+        .searchable(text: $settingsSearchText, placement: .toolbar, prompt: "搜索设置项")
         .navigationTitle(L10n.settingsTitle)
         .frame(minWidth: 420, minHeight: 360)
         .alert(L10n.settingsSpritePacksImportError, isPresented: $showError) {
@@ -1301,6 +1461,12 @@ public struct SettingsView: View {
         .task {
             await pluginSettingsViewModel.refresh()
         }
+        .onDisappear {
+            pendingAIConfigSaveTask?.cancel()
+            pendingAIMemorySaveTask?.cancel()
+            pendingNotificationSaveTask?.cancel()
+            pendingPetSoundSaveTask?.cancel()
+        }
         .sheet(isPresented: $showPluginCreator) {
             pluginCreatorSheet
         }
@@ -1357,6 +1523,22 @@ public struct SettingsView: View {
         .frame(minWidth: 460)
     }
 
+    private var searchKeyword: String {
+        settingsSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func shouldShowSection(_ section: SettingsScope) -> Bool {
+        settingsScope == .all || settingsScope == section
+    }
+
+    private func matchesSearchText(_ fields: String...) -> Bool {
+        let keyword = searchKeyword
+        guard !keyword.isEmpty else {
+            return true
+        }
+        return fields.contains { $0.localizedCaseInsensitiveContains(keyword) }
+    }
+
     private func statusColor(for status: CapabilityItemStatus) -> Color {
         switch status {
         case .active:
@@ -1365,6 +1547,15 @@ public struct SettingsView: View {
             return .yellow
         case .inactive:
             return .gray
+        }
+    }
+
+    private var aiEndpointPlaceholder: String {
+        switch aiBackend {
+        case .ollama:
+            return "http://localhost:11434"
+        case .openAICompatible:
+            return "https://api.openai.com/v1"
         }
     }
 
@@ -1389,7 +1580,7 @@ public struct SettingsView: View {
         case .ollama:
             return L10n.settingsAIBackendOllama
         case .openAICompatible:
-            return L10n.settingsAIBackendOpenAICompatible
+            return "OpenAI 方式"
         }
     }
 
@@ -1406,7 +1597,81 @@ public struct SettingsView: View {
         }
     }
 
-    private func saveAIMemoryConfig() {
+    private func scheduleAIConfigSave(immediate: Bool = false) {
+        pendingAIConfigSaveTask?.cancel()
+        let endpoint = ollamaEndpoint
+        let model = ollamaModel
+        let prompt = aiSystemPrompt
+        let backend = aiBackend
+        let apiKey = openAIApiKey
+
+        let performSave = { [onSaveAIConfig] in
+            onSaveAIConfig(endpoint, model, prompt, backend, apiKey)
+        }
+
+        guard !immediate else {
+            performSave()
+            return
+        }
+
+        pendingAIConfigSaveTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(280))
+            guard !Task.isCancelled else { return }
+            performSave()
+        }
+    }
+
+    private func scheduleNotificationConfigSave(immediate: Bool = false) {
+        pendingNotificationSaveTask?.cancel()
+        let token = githubToken
+        let enabled = webhookEnabled
+        let port = webhookPort
+        let secret = webhookSecret
+
+        let performSave = { [onSaveNotificationConfig] in
+            onSaveNotificationConfig(token, enabled, port, secret)
+        }
+
+        guard !immediate else {
+            performSave()
+            return
+        }
+
+        pendingNotificationSaveTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(220))
+            guard !Task.isCancelled else { return }
+            performSave()
+        }
+    }
+
+    private func schedulePetSoundSave(for petID: UUID, immediate: Bool = false) {
+        pendingPetSoundSaveTask?.cancel()
+        let usesCustomSound = editUsesCustomSound
+        let enabled = editSoundEnabled
+        let volume = Float(editSoundVolume)
+
+        let performSave = { [onUpdatePetSound] in
+            onUpdatePetSound(
+                petID,
+                usesCustomSound ? enabled : nil,
+                usesCustomSound ? volume : nil
+            )
+        }
+
+        guard !immediate else {
+            performSave()
+            return
+        }
+
+        pendingPetSoundSaveTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(120))
+            guard !Task.isCancelled else { return }
+            performSave()
+        }
+    }
+
+    private func saveAIMemoryConfig(immediate: Bool = false) {
+        pendingAIMemorySaveTask?.cancel()
         let trimmedEndpoint = memoryWorkerEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedAuthMode = memoryWorkerAuthMode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let resolvedAuthMode = (trimmedAuthMode == "bearer") ? "bearer" : "basic"
@@ -1420,16 +1685,29 @@ public struct SettingsView: View {
             memoryWorkerQueryLimit = clampedLimit
         }
 
-        onSaveAIMemoryConfig(
-            memoryWorkerEnabled,
-            trimmedEndpoint,
-            resolvedAuthMode,
-            trimmedUsername,
-            trimmedSecret,
-            trimmedScope,
-            trimmedSubject,
-            clampedLimit
-        )
+        let performSave = { [onSaveAIMemoryConfig] in
+            onSaveAIMemoryConfig(
+                memoryWorkerEnabled,
+                trimmedEndpoint,
+                resolvedAuthMode,
+                trimmedUsername,
+                trimmedSecret,
+                trimmedScope,
+                trimmedSubject,
+                clampedLimit
+            )
+        }
+
+        guard !immediate else {
+            performSave()
+            return
+        }
+
+        pendingAIMemorySaveTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(280))
+            guard !Task.isCancelled else { return }
+            performSave()
+        }
     }
 
     @ViewBuilder
@@ -1591,6 +1869,7 @@ public struct SettingsView: View {
     }
 
     private func startEditing(_ pet: PetProfileItem) {
+        pendingPetSoundSaveTask?.cancel()
         editName = pet.name
         editSpritePack = pet.spritePack
         editSize = pet.size

@@ -207,13 +207,16 @@ public actor OllamaService: AIEngineProtocol {
     private var endpoint: URL
     private var backend: AIBackend
     private var model: String
+    /// For `.openAICompatible` only: sent as `Authorization: Bearer`. Empty = omit header.
+    private var openAIApiKey: String
     private var onConversationUpdated: (@Sendable (String, String, String, String?, String?) async -> Void)?
     private var currentStatus: AIEngineStatus = .notConfigured
 
-    public init(endpoint: URL, model: String, backend: AIBackend = .ollama) {
+    public init(endpoint: URL, model: String, backend: AIBackend = .ollama, openAIApiKey: String = "") {
         self.endpoint = endpoint
         self.model = model
         self.backend = backend
+        self.openAIApiKey = openAIApiKey
     }
 
     public var status: AIEngineStatus {
@@ -258,6 +261,7 @@ public actor OllamaService: AIEngineProtocol {
             var request = URLRequest(url: Self.resolveOpenAIModelsURL(from: endpoint))
             request.timeoutInterval = 8
             request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+            applyOpenAIAuthorizationIfNeeded(to: &request)
 
             let (_, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,
@@ -279,6 +283,7 @@ public actor OllamaService: AIEngineProtocol {
                     maxTokens: 1
                 )
                 request.timeoutInterval = 120
+                applyOpenAIAuthorizationIfNeeded(to: &request)
 
                 let (_, response) = try await URLSession.shared.data(for: request)
                 guard let httpResponse = response as? HTTPURLResponse,
@@ -339,7 +344,7 @@ public actor OllamaService: AIEngineProtocol {
                 }
             }
         case .openAICompatible:
-            let request = try Self.buildOpenAICompatibleChatRequest(
+            var request = try Self.buildOpenAICompatibleChatRequest(
                 endpoint: endpoint,
                 model: resolvedModelName(),
                 history: activeHistory,
@@ -347,6 +352,7 @@ public actor OllamaService: AIEngineProtocol {
                 userMessage: message,
                 stream: false
             )
+            applyOpenAIAuthorizationIfNeeded(to: &request)
 
             return AsyncThrowingStream<String, Error> { continuation in
                 Task {
@@ -421,7 +427,7 @@ public actor OllamaService: AIEngineProtocol {
                 }
             }
         case .openAICompatible:
-            let request = try Self.buildOpenAICompatibleChatRequest(
+            var request = try Self.buildOpenAICompatibleChatRequest(
                 endpoint: endpoint,
                 model: resolvedModelName(),
                 history: activeHistory,
@@ -430,6 +436,7 @@ public actor OllamaService: AIEngineProtocol {
                 tools: tools,
                 stream: false
             )
+            applyOpenAIAuthorizationIfNeeded(to: &request)
 
             return AsyncThrowingStream<String, Error> { continuation in
                 Task {
@@ -513,11 +520,23 @@ public actor OllamaService: AIEngineProtocol {
         currentSessionId = sessionId
     }
 
-    public func updateConfig(endpoint: URL, model: String, backend: AIBackend) {
+    public func updateConfig(endpoint: URL, model: String, backend: AIBackend, openAIApiKey: String = "") {
         self.endpoint = endpoint
         self.model = model
         self.backend = backend
+        self.openAIApiKey = openAIApiKey
         currentStatus = .notConfigured
+    }
+
+    private func applyOpenAIAuthorizationIfNeeded(to request: inout URLRequest) {
+        guard backend == .openAICompatible else {
+            return
+        }
+        let trimmed = openAIApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return
+        }
+        request.setValue("Bearer \(trimmed)", forHTTPHeaderField: "Authorization")
     }
 
     public func updateSystemPrompt(_ prompt: String) {
@@ -573,7 +592,7 @@ public actor OllamaService: AIEngineProtocol {
 
             return ThinkingStripper.strip(content)
         case .openAICompatible:
-            let request = try Self.buildOpenAICompatibleChatRequest(
+            var request = try Self.buildOpenAICompatibleChatRequest(
                 endpoint: endpoint,
                 model: resolvedModelName(),
                 history: [],
@@ -581,6 +600,7 @@ public actor OllamaService: AIEngineProtocol {
                 userMessage: context,
                 stream: false
             )
+            applyOpenAIAuthorizationIfNeeded(to: &request)
 
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,
@@ -651,7 +671,7 @@ public actor OllamaService: AIEngineProtocol {
             }
             responseText = (try? JSONDecoder().decode(NonStreamResponse.self, from: data))?.message?.content
         case .openAICompatible:
-            let request = try Self.buildOpenAICompatibleChatRequest(
+            var request = try Self.buildOpenAICompatibleChatRequest(
                 endpoint: endpoint,
                 model: resolvedModelName(),
                 history: [],
@@ -659,6 +679,7 @@ public actor OllamaService: AIEngineProtocol {
                 userMessage: conversationText,
                 stream: false
             )
+            applyOpenAIAuthorizationIfNeeded(to: &request)
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                 return []
@@ -707,7 +728,8 @@ public actor OllamaService: AIEngineProtocol {
         userMessage: String,
         tools: [OllamaTool]? = nil,
         stream: Bool = false,
-        maxTokens: Int? = nil
+        maxTokens: Int? = nil,
+        authorizationBearer: String? = nil
     ) throws -> URLRequest {
         let payload = OpenAIChatPayload(
             model: model,
@@ -726,6 +748,9 @@ public actor OllamaService: AIEngineProtocol {
         request.httpBody = try JSONEncoder().encode(payload)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        if let bearer = authorizationBearer?.trimmingCharacters(in: .whitespacesAndNewlines), !bearer.isEmpty {
+            request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+        }
         return request
     }
 

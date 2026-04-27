@@ -192,6 +192,30 @@ final class OllamaServiceTests: XCTestCase {
         XCTAssertEqual(request.url?.absoluteString, "http://127.0.0.1:8787/v1/chat/completions")
     }
 
+    func testBuildOpenAICompatibleChatRequest_setsBearerWhenAuthorizationProvided() throws {
+        let endpoint = URL(string: "https://api.openai.com/v1")!
+
+        let withAuth = try OllamaService.buildOpenAICompatibleChatRequest(
+            endpoint: endpoint,
+            model: "gpt-4o-mini",
+            history: [],
+            systemPrompt: "x",
+            userMessage: "y",
+            authorizationBearer: " sk-secret "
+        )
+        XCTAssertEqual(withAuth.value(forHTTPHeaderField: "Authorization"), "Bearer sk-secret")
+
+        let noAuth = try OllamaService.buildOpenAICompatibleChatRequest(
+            endpoint: endpoint,
+            model: "gpt-4o-mini",
+            history: [],
+            systemPrompt: "x",
+            userMessage: "y",
+            authorizationBearer: "   "
+        )
+        XCTAssertNil(noAuth.value(forHTTPHeaderField: "Authorization"))
+    }
+
     func testParseChatResponse() throws {
         let line = #"{"model":"llama3.2","message":{"role":"assistant","content":"你"},"done":false}"#
 
@@ -549,7 +573,7 @@ final class OllamaServiceTests: XCTestCase {
         )
         let newEndpoint = URL(string: "http://127.0.0.1:11435")!
 
-        await service.updateConfig(endpoint: newEndpoint, model: "qwen2.5", backend: .openAICompatible)
+        await service.updateConfig(endpoint: newEndpoint, model: "qwen2.5", backend: .openAICompatible, openAIApiKey: "")
 
         let config = await service.configSnapshot()
         XCTAssertEqual(config.endpoint, newEndpoint)

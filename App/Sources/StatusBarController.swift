@@ -166,14 +166,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             return
         }
 
-        if let image = NSImage(systemSymbolName: "cat.fill", accessibilityDescription: "VitaPet")
-            ?? NSImage(systemSymbolName: "pawprint.fill", accessibilityDescription: "VitaPet") {
-            image.isTemplate = true
-            button.image = image
-        } else {
-            button.title = "🐱"
-        }
-
+        button.image = Self.makeStatusBarImage()
+        button.imageScaling = .scaleProportionallyDown
+        button.imagePosition = .imageOnly
+        button.image?.isTemplate = true
+        button.image?.accessibilityDescription = "VitaPet"
         button.toolTip = tooltip(for: currentMoodLevel())
     }
 
@@ -441,6 +438,122 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         let item = menu.addItem(withTitle: title, action: action, keyEquivalent: keyEquivalent)
         item.target = self
         item.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
+    }
+
+    private static func statusBarIconPointSize() -> CGFloat {
+        let thickness = NSStatusBar.system.thickness
+        return max(16, min(19, thickness - 3))
+    }
+
+    private static func makeStatusBarImage() -> NSImage {
+        let pointSize = statusBarIconPointSize()
+        return makeTemplateCatBubbleIcon(pointSize: pointSize)
+    }
+
+    /// Draw a compact brand mark instead of relying on whichever SF Symbol set
+    /// happens to be available on the host macOS version.
+    private static func makeTemplateCatBubbleIcon(pointSize: CGFloat) -> NSImage {
+        let scale: CGFloat = 4
+        let canvas = pointSize * scale
+        let image = NSImage(size: NSSize(width: canvas, height: canvas), flipped: false) { rect in
+            guard let ctx = NSGraphicsContext.current?.cgContext else {
+                return false
+            }
+
+            let inset = canvas * 0.14
+            let glyph = NSRect(
+                x: inset,
+                y: inset,
+                width: canvas - inset * 2,
+                height: canvas - inset * 2
+            )
+            let gw = glyph.width
+            let gh = glyph.height
+            let gx = glyph.minX
+            let gy = glyph.minY
+
+            let bubbleRect = NSRect(
+                x: gx + gw * 0.08,
+                y: gy + gh * 0.10,
+                width: gw * 0.8,
+                height: gh * 0.62
+            )
+
+            NSColor.black.setFill()
+
+            let leftEar = NSBezierPath()
+            leftEar.move(to: NSPoint(x: gx + gw * 0.24, y: gy + gh * 0.66))
+            leftEar.line(to: NSPoint(x: gx + gw * 0.36, y: gy + gh * 0.96))
+            leftEar.line(to: NSPoint(x: gx + gw * 0.48, y: gy + gh * 0.66))
+            leftEar.close()
+            leftEar.fill()
+
+            let rightEar = NSBezierPath()
+            rightEar.move(to: NSPoint(x: gx + gw * 0.76, y: gy + gh * 0.66))
+            rightEar.line(to: NSPoint(x: gx + gw * 0.64, y: gy + gh * 0.96))
+            rightEar.line(to: NSPoint(x: gx + gw * 0.52, y: gy + gh * 0.66))
+            rightEar.close()
+            rightEar.fill()
+
+            let bubble = NSBezierPath(
+                roundedRect: bubbleRect,
+                xRadius: bubbleRect.width * 0.26,
+                yRadius: bubbleRect.height * 0.26
+            )
+            bubble.fill()
+
+            let tail = NSBezierPath()
+            tail.move(to: NSPoint(x: bubbleRect.minX + bubbleRect.width * 0.2, y: bubbleRect.minY + bubbleRect.height * 0.08))
+            tail.line(to: NSPoint(x: bubbleRect.minX + bubbleRect.width * 0.05, y: bubbleRect.minY - gh * 0.04))
+            tail.line(to: NSPoint(x: bubbleRect.minX + bubbleRect.width * 0.3, y: bubbleRect.minY + bubbleRect.height * 0.02))
+            tail.close()
+            tail.fill()
+
+            ctx.saveGState()
+            ctx.setBlendMode(.clear)
+
+            let eyeWidth = gw * 0.095
+            let eyeHeight = gh * 0.14
+            let eyeY = gy + gh * 0.36
+            let eyeOffset = gw * 0.15
+            let leftEye = NSBezierPath(
+                roundedRect: NSRect(
+                    x: gx + gw * 0.5 - eyeOffset - eyeWidth * 0.5,
+                    y: eyeY,
+                    width: eyeWidth,
+                    height: eyeHeight
+                ),
+                xRadius: eyeWidth * 0.5,
+                yRadius: eyeHeight * 0.5
+            )
+            leftEye.fill()
+
+            let rightEye = NSBezierPath(
+                roundedRect: NSRect(
+                    x: gx + gw * 0.5 + eyeOffset - eyeWidth * 0.5,
+                    y: eyeY,
+                    width: eyeWidth,
+                    height: eyeHeight
+                ),
+                xRadius: eyeWidth * 0.5,
+                yRadius: eyeHeight * 0.5
+            )
+            rightEye.fill()
+
+            let nose = NSBezierPath()
+            nose.move(to: NSPoint(x: gx + gw * 0.5, y: gy + gh * 0.25))
+            nose.line(to: NSPoint(x: gx + gw * 0.448, y: gy + gh * 0.31))
+            nose.line(to: NSPoint(x: gx + gw * 0.552, y: gy + gh * 0.31))
+            nose.close()
+            nose.fill()
+
+            ctx.restoreGState()
+
+            return true
+        }
+        image.size = NSSize(width: pointSize, height: pointSize)
+        image.isTemplate = true
+        return image
     }
 
     private func tooltip(for level: PetMood.MoodLevel) -> String {

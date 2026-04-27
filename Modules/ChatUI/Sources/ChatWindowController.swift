@@ -26,6 +26,7 @@ public final class ChatWindowController: NSWindowController {
     private var aiBackend: @MainActor () -> AIEngine.AIBackend = { .ollama }
     private var aiModel: @MainActor () -> String = { "llama3.2" }
     private var aiStatus: @MainActor () -> AIEngineStatus = { .notConfigured }
+    private var openAIApiKey: @MainActor () -> String = { "" }
     private var aiSystemPrompt: @MainActor () -> String = { "" }
     private var memoryWorkerEnabled: @MainActor () -> Bool = { false }
     private var memoryWorkerEndpoint: @MainActor () -> String = { "https://memory.example.com" }
@@ -38,7 +39,7 @@ public final class ChatWindowController: NSWindowController {
     private var onTestConnection: @MainActor () -> Void = {}
     private var onTestAIMemoryConnection: @MainActor () async -> String? = { nil }
     private var onTestAIMemoryWrite: @MainActor () async -> String? = { nil }
-    private var onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend) -> Void = { _, _, _, _ in }
+    private var onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend, String) -> Void = { _, _, _, _, _ in }
     private var onSaveAIMemoryConfig: @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = { _, _, _, _, _, _, _, _ in }
     private var githubToken: @MainActor () -> String = { "" }
     private var webhookEnabled: @MainActor () -> Bool = { false }
@@ -82,7 +83,7 @@ public final class ChatWindowController: NSWindowController {
         activityLogViewModel: ActivityLogViewModel = ActivityLogViewModel(loadEvents: { _, _ in [] }),
         statisticsViewModel: StatisticsViewModel = StatisticsViewModel()
     ) {
-        let contentRect = NSRect(x: 0, y: 0, width: 520, height: 700)
+        let contentRect = NSRect(x: 0, y: 0, width: 860, height: 640)
         let styleMask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
         let window = NSWindow(
             contentRect: contentRect,
@@ -94,6 +95,7 @@ public final class ChatWindowController: NSWindowController {
         window.title = "VitaPet"
         window.level = .normal
         window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 760, height: 580)
         window.center()
         window.contentView = NSHostingView(rootView: ChatView(viewModel: chatViewModel))
 
@@ -138,8 +140,8 @@ public final class ChatWindowController: NSWindowController {
         window?.contentView = NSHostingView(
             rootView: TabbedChatView(viewModel: chatViewModel, availablePets: listAvailablePets())
         )
-        if let window, window.frame.width < 620 {
-            window.setContentSize(NSSize(width: 700, height: 520))
+        if let window, window.frame.width < 760 {
+            window.setContentSize(NSSize(width: 860, height: 640))
             window.center()
         }
         // Float above other apps so chat stays visible when switching workspace.
@@ -168,6 +170,7 @@ public final class ChatWindowController: NSWindowController {
                 ollamaEndpoint: aiEndpoint(),
                 aiBackend: aiBackend(),
                 ollamaModel: aiModel(),
+                openAIApiKey: openAIApiKey(),
                 aiSystemPrompt: aiSystemPrompt(),
                 memoryWorkerEnabled: memoryWorkerEnabled(),
                 memoryWorkerEndpoint: memoryWorkerEndpoint(),
@@ -312,6 +315,7 @@ public final class ChatWindowController: NSWindowController {
         aiEndpoint: @escaping @MainActor () -> String,
         aiBackend: @escaping @MainActor () -> AIEngine.AIBackend,
         aiModel: @escaping @MainActor () -> String,
+        openAIApiKey: @escaping @MainActor () -> String = { "" },
         aiSystemPrompt: @escaping @MainActor () -> String,
         memoryWorkerEnabled: @escaping @MainActor () -> Bool = { false },
         memoryWorkerEndpoint: @escaping @MainActor () -> String = { "https://memory.example.com" },
@@ -325,12 +329,13 @@ public final class ChatWindowController: NSWindowController {
         onTestConnection: @escaping @MainActor () -> Void = {},
         onTestAIMemoryConnection: @escaping @MainActor () async -> String? = { nil },
         onTestAIMemoryWrite: @escaping @MainActor () async -> String? = { nil },
-        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend) -> Void = { _, _, _, _ in },
+        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend, String) -> Void = { _, _, _, _, _ in },
         onSaveAIMemoryConfig: @escaping @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = { _, _, _, _, _, _, _, _ in }
     ) {
         self.aiEndpoint = aiEndpoint
         self.aiBackend = aiBackend
         self.aiModel = aiModel
+        self.openAIApiKey = openAIApiKey
         self.aiSystemPrompt = aiSystemPrompt
         self.memoryWorkerEnabled = memoryWorkerEnabled
         self.memoryWorkerEndpoint = memoryWorkerEndpoint

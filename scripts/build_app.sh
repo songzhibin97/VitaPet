@@ -9,24 +9,39 @@ BUNDLE_ID="com.vitapet.VitaPet"
 VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0-dev")"
 VERSION="${VERSION#v}"
 
-BUILD_DIR=".build/release"
-OUT_DIR="dist"
-APP_DIR="${OUT_DIR}/${APP_NAME}.app"
+ARCHS_ENV="${ARCHS:-}"
+if [ -n "${ARCHS_ENV}" ]; then
+  # shellcheck disable=SC2206
+  ARCH_LIST=(${ARCHS_ENV})
+else
+  ARCH_LIST=("$(uname -m)")
+fi
 
-echo "==> swift build -c release"
-swift build -c release
+OUT_DIR="dist"
+APP_BASENAME="${APP_NAME}.app"
+APP_DIR="${OUT_DIR}/${APP_BASENAME}"
+
+BUILD_ARGS=(-c release)
+for arch in "${ARCH_LIST[@]}"; do
+  BUILD_ARGS+=(--arch "$arch")
+done
+
+echo "==> swift build ${BUILD_ARGS[*]}"
+swift build "${BUILD_ARGS[@]}"
+
+BIN_DIR="$(swift build "${BUILD_ARGS[@]}" --show-bin-path)"
 
 rm -rf "${APP_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS"
 mkdir -p "${APP_DIR}/Contents/Resources"
 
-cp "${BUILD_DIR}/${BIN_NAME}" "${APP_DIR}/Contents/MacOS/${BIN_NAME}"
+cp "${BIN_DIR}/${BIN_NAME}" "${APP_DIR}/Contents/MacOS/${BIN_NAME}"
 
 # SwiftPM's generated Bundle.module accessor looks for resource bundles at
 # Bundle.main.bundleURL — for a .app that's the .app root, not Contents/Resources.
 # Place bundles at both locations: the accessor path (app root) and the standard
 # Contents/Resources for discoverability.
-for bundle in "${BUILD_DIR}"/*.bundle; do
+for bundle in "${BIN_DIR}"/*.bundle; do
   [ -e "$bundle" ] || continue
   cp -R "$bundle" "${APP_DIR}/"
   cp -R "$bundle" "${APP_DIR}/Contents/Resources/"
@@ -84,14 +99,19 @@ codesign --force --deep --sign - "${APP_DIR}" >/dev/null 2>&1 || true
 
 echo "==> Built ${APP_DIR}"
 
-if [ "${INSTALL:-0}" = "1" ]; then
-  DEST="/Applications/${APP_NAME}.app"
+# Default: copy into /Applications so local builds match “install the app” workflow.
+# Set INSTALL=0 to only produce dist/ (e.g. CI, or you’ll copy the .app yourself).
+if [ "${INSTALL:-1}" = "1" ]; then
+  DEST="/Applications/${APP_BASENAME}"
   echo "==> Installing to ${DEST}"
   rm -rf "${DEST}"
   cp -R "${APP_DIR}" "${DEST}"
   echo "==> Installed. Launch via Applications or:"
   echo "    open \"${DEST}\""
+  LEGACY="/Applications/${APP_NAME}-arm64.app"
+  if [ -d "$LEGACY" ]; then
+    echo "==> 旧包仍可手动删除: rm -rf \"${LEGACY}\""
+  fi
 else
-  echo "==> To install: INSTALL=1 $0"
-  echo "==> Or manually: cp -R \"${APP_DIR}\" /Applications/"
+  echo "==> Skipped /Applications (INSTALL=0). App bundle: ${APP_DIR}"
 fi

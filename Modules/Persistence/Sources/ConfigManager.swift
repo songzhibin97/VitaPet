@@ -14,6 +14,8 @@ public final class ConfigManager {
         public var ollamaEndpoint: String
         public var aiBackend: String
         public var ollamaModel: String
+        /// API Key for OpenAI-compatible backends; sent as `Authorization: Bearer`. Empty = no header (e.g. local proxy).
+        public var openAIApiKey: String
         public var aiSystemPrompt: String
         public var aiProactiveEnabled: Bool
         public var aiProactiveInterval: Int
@@ -45,6 +47,7 @@ public final class ConfigManager {
             ollamaEndpoint: String = "http://localhost:11434",
             aiBackend: String = "ollama",
             ollamaModel: String = "llama3.2",
+            openAIApiKey: String = "",
             aiSystemPrompt: String = "",
             aiProactiveEnabled: Bool = true,
             aiProactiveInterval: Int = 45,
@@ -84,6 +87,7 @@ public final class ConfigManager {
             self.ollamaEndpoint = ollamaEndpoint
             self.aiBackend = aiBackend
             self.ollamaModel = ollamaModel
+            self.openAIApiKey = openAIApiKey
             self.aiSystemPrompt = aiSystemPrompt
             self.aiProactiveEnabled = aiProactiveEnabled
             self.aiProactiveInterval = aiProactiveInterval
@@ -116,6 +120,7 @@ public final class ConfigManager {
             case ollamaEndpoint
             case aiBackend
             case ollamaModel
+            case openAIApiKey
             case aiSystemPrompt
             case aiProactiveEnabled
             case aiProactiveInterval
@@ -163,6 +168,7 @@ public final class ConfigManager {
             ollamaEndpoint = try container.decodeIfPresent(String.self, forKey: .ollamaEndpoint) ?? "http://localhost:11434"
             aiBackend = try container.decodeIfPresent(String.self, forKey: .aiBackend) ?? "ollama"
             ollamaModel = try container.decodeIfPresent(String.self, forKey: .ollamaModel) ?? "llama3.2"
+            openAIApiKey = try container.decodeIfPresent(String.self, forKey: .openAIApiKey) ?? ""
             aiSystemPrompt = try container.decodeIfPresent(String.self, forKey: .aiSystemPrompt) ?? ""
             aiProactiveEnabled = try container.decodeIfPresent(Bool.self, forKey: .aiProactiveEnabled) ?? true
             aiProactiveInterval = try container.decodeIfPresent(Int.self, forKey: .aiProactiveInterval) ?? 45

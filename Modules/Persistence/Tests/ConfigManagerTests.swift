@@ -47,6 +47,7 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertEqual(manager.config.pets[0].spritePack, "default")
         XCTAssertTrue(manager.config.enabledCapabilities.isEmpty)
         XCTAssertEqual(manager.config.aiBackend, "ollama")
+        XCTAssertEqual(manager.config.openAIApiKey, "")
         XCTAssertEqual(
             manager.config.locale,
             (Locale.preferredLanguages.first ?? Locale.current.identifier).hasPrefix("zh") ? "zh-Hans" : "en"
@@ -170,6 +171,7 @@ final class ConfigManagerTests: XCTestCase {
             ollamaEndpoint: "http://127.0.0.1:11435",
             aiBackend: "openai-compatible",
             ollamaModel: "qwen2.5",
+            openAIApiKey: "sk-test",
             aiSystemPrompt: "Be concise",
             aiProactiveEnabled: false,
             aiProactiveInterval: 90,
@@ -200,6 +202,7 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertEqual(decoded.ollamaEndpoint, "http://127.0.0.1:11435")
         XCTAssertEqual(decoded.aiBackend, "openai-compatible")
         XCTAssertEqual(decoded.ollamaModel, "qwen2.5")
+        XCTAssertEqual(decoded.openAIApiKey, "sk-test")
         XCTAssertEqual(decoded.aiSystemPrompt, "Be concise")
         XCTAssertEqual(decoded.spaceMode, "singleSpace")
         XCTAssertEqual(decoded.memoryWorkerEnabled, true)

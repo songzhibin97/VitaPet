@@ -92,20 +92,56 @@ public final class ChatViewModel {
 
             do {
                 let stream = try await sendToAI(trimmedInput, aiHistory)
+                let clock = ContinuousClock()
+                let streamingFlushInterval: Duration = .milliseconds(40)
+                var bufferedReply = ""
+                var pendingChunk = ""
+                var lastFlush = clock.now
+
+                func assistantMessageWithContent(_ content: String) -> ChatMessage {
+                    ChatMessage(
+                        id: assistantMessage.id,
+                        role: .assistant,
+                        content: content,
+                        timestamp: assistantMessage.timestamp,
+                        petId: assistantMessage.petId,
+                        petName: assistantMessage.petName
+                    )
+                }
 
                 for try await chunk in stream {
                     guard let currentAssistantMessage = currentMessages.last else {
                         break
                     }
                     assistantMessage = currentAssistantMessage
-                    replaceLastMessageInCurrentConversation(with: ChatMessage(
-                        id: assistantMessage.id,
-                        role: .assistant,
-                        content: assistantMessage.content + chunk,
-                        timestamp: assistantMessage.timestamp,
-                        petId: assistantMessage.petId,
-                        petName: assistantMessage.petName
-                    ))
+                    pendingChunk += chunk
+                    let now = clock.now
+                    if now - lastFlush >= streamingFlushInterval {
+                        bufferedReply += pendingChunk
+                        pendingChunk.removeAll(keepingCapacity: true)
+                        lastFlush = now
+
+                        replaceLastMessageInCurrentConversation(
+                            with: assistantMessageWithContent(bufferedReply),
+                            updatesPreview: false
+                        )
+                    }
+                }
+
+                if !pendingChunk.isEmpty {
+                    bufferedReply += pendingChunk
+                    pendingChunk.removeAll(keepingCapacity: true)
+                    replaceLastMessageInCurrentConversation(
+                        with: assistantMessageWithContent(bufferedReply),
+                        updatesPreview: false
+                    )
+                }
+                if let currentAssistantMessage = currentMessages.last {
+                    assistantMessage = currentAssistantMessage
+                    replaceLastMessageInCurrentConversation(
+                        with: assistantMessageWithContent(bufferedReply),
+                        updatesPreview: true
+                    )
                 }
 
                 onAssistantReplied?()
@@ -258,14 +294,23 @@ public final class ChatViewModel {
         updateConversationPreview(for: id, using: message)
     }
 
-    private func replaceLastMessageInCurrentConversation(with message: ChatMessage) {
+    private func replaceLastMessageInCurrentConversation(with message: ChatMessage, updatesPreview: Bool = true) {
         guard let id = selectedConversationId,
               !currentMessages.isEmpty else {
             return
         }
-        currentMessages[currentMessages.count - 1] = message
+        let lastIndex = currentMessages.count - 1
+        if currentMessages[lastIndex] == message {
+            if updatesPreview {
+                updateConversationPreview(for: id, using: message)
+            }
+            return
+        }
+        currentMessages[lastIndex] = message
         messagesByConversation[id] = currentMessages
-        updateConversationPreview(for: id, using: message)
+        if updatesPreview {
+            updateConversationPreview(for: id, using: message)
+        }
     }
 
     private func updateConversationPreview(for conversationId: String, using message: ChatMessage) {

@@ -115,7 +115,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let ollamaService = OllamaService(
             endpoint: initialEndpoint,
             model: initialModel,
-            backend: initialBackend
+            backend: initialBackend,
+            openAIApiKey: configManager.config.openAIApiKey
         )
         self.ollamaService = ollamaService
         let initialMemoryConfig = Self.memoryWorkerConfig(from: configManager.config)
@@ -204,13 +205,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
-        let onSaveAIConfig: @MainActor (String, String, String, AIBackend) -> Void = { [weak self, weak configManager] endpoint, model, aiSystemPrompt, backend in
+        let onSaveAIConfig: @MainActor (String, String, String, AIBackend, String) -> Void = { [weak self, weak configManager] endpoint, model, aiSystemPrompt, backend, openAIApiKey in
             guard let self,
                   let configManager else {
                 return
             }
 
             let trimmedPrompt = aiSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedOpenAIKey = openAIApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
             let resolvedEndpointValue = Self.normalizedAIEndpoint(endpoint)
             let currentBackend = Self.inferredAIBackend(
                 preferred: Self.resolvedAIBackend(from: configManager.config.aiBackend),
@@ -229,6 +231,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     $0.ollamaEndpoint = resolvedEndpointValue
                     $0.aiBackend = effectiveBackend.rawValue
                     $0.ollamaModel = resolvedModel
+                    $0.openAIApiKey = trimmedOpenAIKey
                     $0.aiSystemPrompt = trimmedPrompt
                 }
             } catch {
@@ -236,7 +239,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             Task {
-                await ollamaService.updateConfig(endpoint: resolvedEndpoint, model: resolvedModel, backend: effectiveBackend)
+                await ollamaService.updateConfig(
+                    endpoint: resolvedEndpoint,
+                    model: resolvedModel,
+                    backend: effectiveBackend,
+                    openAIApiKey: trimmedOpenAIKey
+                )
                 await ollamaService.updateSystemPrompt(trimmedPrompt)
                 await ollamaService.checkConnection()
                 self.aiStatus = await ollamaService.status
@@ -629,6 +637,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             aiModel: { [weak configManager] in
                 configManager?.config.ollamaModel ?? "llama3.2"
+            },
+            openAIApiKey: { [weak configManager] in
+                configManager?.config.openAIApiKey ?? ""
             },
             aiSystemPrompt: { [weak configManager] in
                 configManager?.config.aiSystemPrompt ?? ""

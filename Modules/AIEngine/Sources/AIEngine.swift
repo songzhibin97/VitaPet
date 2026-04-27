@@ -49,7 +49,7 @@ public enum AIBackend: String, Codable, Sendable, CaseIterable {
         case .ollama:
             return "llama3.2"
         case .openAICompatible:
-            return "auto"
+            return "gpt-4o-mini"
         }
     }
 }

@@ -5,6 +5,7 @@ public struct MessageBubble: View, Equatable {
     let message: ChatMessage
     let isStreaming: Bool
     let showsThinking: Bool
+    private let parsedContent: ParsedMessage
     @State private var thinkingExpanded: Bool = true
 
     nonisolated public static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
@@ -17,6 +18,7 @@ public struct MessageBubble: View, Equatable {
         self.message = message
         self.isStreaming = isStreaming
         self.showsThinking = showsThinking
+        self.parsedContent = Self.split(message.content)
     }
 
     public var body: some View {
@@ -38,7 +40,7 @@ public struct MessageBubble: View, Equatable {
                     .padding(.horizontal, 4)
                 }
 
-                if showsThinking, let thinking = parsed.thinking {
+                if showsThinking, let thinking = parsedContent.thinking {
                     thinkingDisclosure(thinking: thinking)
                 }
 
@@ -58,7 +60,7 @@ public struct MessageBubble: View, Equatable {
     }
 
     private var bubble: some View {
-        Text(displayedReply.isEmpty ? " " : displayedReply)
+        Text(parsedContent.reply.isEmpty ? " " : parsedContent.reply)
             .textSelection(.enabled)
             .foregroundStyle(foregroundColor)
             .fixedSize(horizontal: false, vertical: true)
@@ -107,12 +109,9 @@ public struct MessageBubble: View, Equatable {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var parsed: (thinking: String?, reply: String) {
-        Self.split(message.content)
-    }
-
-    private var displayedReply: String {
-        parsed.reply
+    private struct ParsedMessage {
+        let thinking: String?
+        let reply: String
     }
 
     /// Parse the live or canonical assistant content into reasoning + reply.
@@ -121,11 +120,11 @@ public struct MessageBubble: View, Equatable {
     ///   - `<think>...</think>{reply}` → split cleanly
     ///   - `<think>...` mid-stream (close hasn't arrived) → show partial thinking, no reply yet
     ///   - tagless leak `{reasoning}</think>{reply}` → reclassify prefix as thinking
-    private static func split(_ text: String) -> (thinking: String?, reply: String) {
+    private static func split(_ text: String) -> ParsedMessage {
         let hasOpen = text.range(of: "<think>", options: .caseInsensitive) != nil
         let hasClose = text.range(of: "</think>", options: .caseInsensitive) != nil
         if !hasOpen && !hasClose {
-            return (nil, text)
+            return ParsedMessage(thinking: nil, reply: text)
         }
 
         if let openRange = text.range(of: "<think>", options: .caseInsensitive) {
@@ -139,14 +138,14 @@ public struct MessageBubble: View, Equatable {
                 let before = String(text[text.startIndex..<openRange.lowerBound])
                 let after = String(text[closeRange.upperBound..<text.endIndex])
                 let reply = (before + after).trimmingCharacters(in: .whitespacesAndNewlines)
-                return (thinking.isEmpty ? nil : thinking, reply)
+                return ParsedMessage(thinking: thinking.isEmpty ? nil : thinking, reply: reply)
             }
             // Open tag, no close yet — surface the in-progress reasoning.
             let before = String(text[text.startIndex..<openRange.lowerBound])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let thinking = String(text[openRange.upperBound..<text.endIndex])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            return (thinking.isEmpty ? nil : thinking, before)
+            return ParsedMessage(thinking: thinking.isEmpty ? nil : thinking, reply: before)
         }
 
         // Tagless leak: stray </think> with no opener (DeepSeek-R1 sometimes
@@ -156,10 +155,10 @@ public struct MessageBubble: View, Equatable {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let reply = String(text[closeRange.upperBound..<text.endIndex])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            return (thinking.isEmpty ? nil : thinking, reply)
+            return ParsedMessage(thinking: thinking.isEmpty ? nil : thinking, reply: reply)
         }
 
-        return (nil, text)
+        return ParsedMessage(thinking: nil, reply: text)
     }
 
     private var isUserMessage: Bool { message.role == .user }
