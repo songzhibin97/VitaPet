@@ -144,12 +144,15 @@ public final class ChatWindowController: NSWindowController {
             window.setContentSize(NSSize(width: 860, height: 640))
             window.center()
         }
-        // Float above other apps so chat stays visible when switching workspace.
+        // Float briefly to ensure chat pops above other apps on launch, then
+        // drop back to normal level so it can be covered like any other window.
         window?.level = .floating
-        window?.collectionBehavior.insert(.canJoinAllSpaces)
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.window?.level = .normal
+        }
     }
 
     public func showSettings() {
@@ -223,11 +226,13 @@ public final class ChatWindowController: NSWindowController {
                 onResetAll: onResetAll
             )
         )
-        showWindow(nil)
         window?.level = .floating
+        showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
-        // 激活应用到前台
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.window?.level = .normal
+        }
     }
 
     public func showSpritePackCreator(initialFrames: [String: [URL]] = [:]) {

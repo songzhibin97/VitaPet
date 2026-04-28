@@ -40,6 +40,7 @@ struct ConversationListView: View {
 
             VStack(spacing: 0) {
                 Divider()
+                    .opacity(0.4)
                 Button(action: onCreateGroup) {
                     HStack(spacing: 10) {
                         Image(systemName: "plus.bubble.fill")
@@ -47,17 +48,30 @@ struct ConversationListView: View {
                         Text(L10n.chatNewGroup)
                             .font(.subheadline.weight(.semibold))
                         Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 11, weight: .semibold))
+                            .opacity(0.55)
                     }
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(Color.white)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 12)
                     .background(
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(Color.white.opacity(0.72))
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        Color.accentColor,
+                                        Color.accentColor.opacity(0.78)
+                                    ],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .shadow(color: Color.accentColor.opacity(0.28), radius: 8, x: 0, y: 3)
                     )
                     .overlay {
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
                     }
                 }
                 .buttonStyle(.plain)
@@ -96,9 +110,8 @@ struct ConversationListView: View {
                             )
                         )
 
-                    Image(systemName: "cat.fill")
-                        .font(.system(size: 18, weight: .regular))
-                        .foregroundStyle(Color.white.opacity(0.94))
+                    CatFaceGlyph(color: Color.white.opacity(0.94))
+                        .padding(8)
                 }
                 .frame(width: 42, height: 42)
 
@@ -150,9 +163,14 @@ struct ConversationRow: View {
                     .fill(iconBackground)
                     .frame(width: 42, height: 42)
 
-                Image(systemName: thread.type == .group ? "person.3.fill" : "pawprint.fill")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(iconForeground)
+                if thread.type == .group {
+                    Image(systemName: "person.3.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(iconForeground)
+                } else {
+                    CatFaceGlyph(color: iconForeground)
+                        .frame(width: 26, height: 26)
+                }
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -190,26 +208,26 @@ struct ConversationRow: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 9)
         .background(
-            RoundedRectangle(cornerRadius: 8)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(
                     isSelected
                         ? AnyShapeStyle(
                             LinearGradient(
                                 colors: [
-                                    Color.accentColor.opacity(0.18),
-                                    Color.accentColor.opacity(0.08)
+                                    Color.accentColor.opacity(0.22),
+                                    Color.accentColor.opacity(0.10)
                                 ],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
                             )
                         )
-                        : AnyShapeStyle(Color.white.opacity(0.42))
+                        : AnyShapeStyle(Color(nsColor: .textBackgroundColor).opacity(0.55))
                 )
         )
         .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(
-                    isSelected ? Color.accentColor.opacity(0.32) : Color.black.opacity(0.05),
+                    isSelected ? Color.accentColor.opacity(0.36) : Color.primary.opacity(0.06),
                     lineWidth: 1
                 )
         }

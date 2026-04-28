@@ -24,7 +24,7 @@ public struct ChatView: View {
             )
             .ignoresSafeArea()
 
-            VStack(spacing: 14) {
+            VStack(spacing: 12) {
                 headerCard
 
                 if case .notConfigured = viewModel.aiStatus {
@@ -39,7 +39,9 @@ public struct ChatView: View {
 
                 inputBar
             }
-            .padding(16)
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+            .padding(.bottom, 14)
         }
         .frame(minWidth: 420, minHeight: 520)
     }
@@ -60,17 +62,16 @@ public struct ChatView: View {
 
             TextField(inputPlaceholderText, text: $viewModel.inputText, axis: .vertical)
                 .textFieldStyle(.plain)
-                .font(.system(size: 15))
+                .font(.system(size: 14))
                 .lineLimit(1 ... 8)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
                 .background(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .fill(Color(nsColor: .textBackgroundColor))
-                        .shadow(color: Color.black.opacity(0.03), radius: 3, x: 0, y: 1)
                 )
                 .overlay {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .strokeBorder(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 1)
                 }
                 .disabled(sendDisabled)
@@ -102,18 +103,18 @@ public struct ChatView: View {
             .disabled(!sendButtonEnabled)
             .help(L10n.chatSend + " (⌘⏎)")
         }
-        .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .padding(10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(Color.white.opacity(0.24), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
         }
     }
 
     private var headerCard: some View {
-        HStack(alignment: .center, spacing: 16) {
+        HStack(alignment: .center, spacing: 12) {
             ZStack {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(
                         LinearGradient(
                             colors: currentConversationType == .group
@@ -123,20 +124,25 @@ public struct ChatView: View {
                             endPoint: .bottomTrailing
                         )
                     )
-                    .shadow(color: currentConversationType == .group ? Color.red.opacity(0.3) : Color.blue.opacity(0.3), radius: 6, x: 0, y: 3)
+                    .shadow(color: currentConversationType == .group ? Color.red.opacity(0.22) : Color.blue.opacity(0.22), radius: 4, x: 0, y: 2)
 
-                Image(systemName: currentConversationType == .group ? "person.3.fill" : "pawprint.fill")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(.white)
+                if currentConversationType == .group {
+                    Image(systemName: "person.3.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                } else {
+                    CatFaceGlyph(color: .white)
+                        .frame(width: 24, height: 24)
+                }
             }
-            .frame(width: 48, height: 48)
+            .frame(width: 38, height: 38)
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(currentConversationTitle)
-                    .font(.title3.weight(.bold))
+                    .font(.headline)
                     .lineLimit(1)
                 Text(currentConversationSubtitle)
-                    .font(.subheadline)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -145,13 +151,12 @@ public struct ChatView: View {
 
             aiStatusBadge
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .shadow(color: Color.black.opacity(0.04), radius: 8, x: 0, y: 4)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .stroke(Color.white.opacity(0.35), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
         }
     }
 
@@ -169,7 +174,7 @@ public struct ChatView: View {
                             MessageBubble(
                                 message: message,
                                 isStreaming: streamingId == message.id && message.role == .assistant,
-                                showsThinking: showThinking
+                                showsThinking: viewModel.showsThinking(for: message.id)
                             )
                             .equatable()
                             .id(message.id)
@@ -184,12 +189,12 @@ public struct ChatView: View {
             .contentMargins(.bottom, 8, for: .scrollContent)
             .scrollContentBackground(.hidden)
             .background(
-                RoundedRectangle(cornerRadius: 28, style: .continuous)
-                    .fill(Color(nsColor: .textBackgroundColor).opacity(0.88))
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color(nsColor: .textBackgroundColor).opacity(0.85))
             )
             .overlay {
-                RoundedRectangle(cornerRadius: 28, style: .continuous)
-                    .stroke(Color.black.opacity(0.05), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 1)
             }
             .onChange(of: viewModel.messages.count) { _, _ in
                 scrollToBottom(proxy: proxy, animated: !viewModel.isStreaming)
@@ -270,16 +275,22 @@ public struct ChatView: View {
     private var minStreamingScrollInterval: TimeInterval { 0.08 }
 
     private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
-        let target: AnyHashable = viewModel.messages.isEmpty
-            ? AnyHashable(bottomAnchorId)
-            : AnyHashable(viewModel.messages.last!.id)
-
-        if animated {
-            withAnimation(.easeOut(duration: 0.18)) {
+        // Always anchor to the trailing sentinel so we land at the very bottom
+        // (past the last bubble's padding). Scrolling to `messages.last!.id`
+        // races with layout for the just-appended bubble — its frame isn't
+        // measured yet at the moment .onChange fires, so the scroll lands
+        // short. Anchoring to the always-trailing Color.clear avoids that.
+        let target = AnyHashable(bottomAnchorId)
+        // Defer to the next runloop tick so SwiftUI has applied the new layout
+        // (input bar shrink + new bubble insertion) before we scroll.
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(target, anchor: .bottom)
+                }
+            } else {
                 proxy.scrollTo(target, anchor: .bottom)
             }
-        } else {
-            proxy.scrollTo(target, anchor: .bottom)
         }
     }
 

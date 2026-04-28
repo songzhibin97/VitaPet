@@ -24,6 +24,11 @@ public final class ChatViewModel {
     public private(set) var aiStatus: AIEngineStatus = .notConfigured
     public private(set) var isStreaming = false
     private var messagesByConversation: [String: [ChatMessage]] = [:]
+    // Per-message capture of the "show thinking" toggle at the moment the
+    // message first lands in the view model. The toggle in ChatView only
+    // affects messages appended *after* it changes — historical messages keep
+    // whatever value was current when they were captured.
+    @ObservationIgnored private var capturedShowThinking: [UUID: Bool] = [:]
 
     private let sendToAI: @Sendable (String, [ChatMessage]) async throws -> AsyncThrowingStream<String, Error>
     private let getAIStatus: @Sendable () async -> AIEngineStatus
@@ -191,6 +196,9 @@ public final class ChatViewModel {
     }
 
     public func loadMessages(for conversationId: String, messages: [ChatMessage]) {
+        for message in messages {
+            captureShowThinkingIfNeeded(for: message.id)
+        }
         messagesByConversation[conversationId] = messages
         if conversationId == selectedConversationId {
             currentMessages = messages
@@ -287,11 +295,32 @@ public final class ChatViewModel {
         guard let id = selectedConversationId else {
             return
         }
+        captureShowThinkingIfNeeded(for: message.id)
         // Single write to currentMessages (the @Observable source of truth);
         // sync the dict afterward without triggering another view-tree update.
         currentMessages.append(message)
         messagesByConversation[id] = currentMessages
         updateConversationPreview(for: id, using: message)
+    }
+
+    /// Returns the captured "show thinking" value for a given message. Falls
+    /// back to the current global toggle if a capture is missing (which only
+    /// happens for messages that pre-date this mechanism).
+    public func showsThinking(for messageId: UUID) -> Bool {
+        if let captured = capturedShowThinking[messageId] {
+            return captured
+        }
+        return currentGlobalShowThinking()
+    }
+
+    private func captureShowThinkingIfNeeded(for messageId: UUID) {
+        guard capturedShowThinking[messageId] == nil else { return }
+        capturedShowThinking[messageId] = currentGlobalShowThinking()
+    }
+
+    private func currentGlobalShowThinking() -> Bool {
+        // Mirror @AppStorage("chat.showThinking") default = true
+        UserDefaults.standard.object(forKey: "chat.showThinking") as? Bool ?? true
     }
 
     private func replaceLastMessageInCurrentConversation(with message: ChatMessage, updatesPreview: Bool = true) {

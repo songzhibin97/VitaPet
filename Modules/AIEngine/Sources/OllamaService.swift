@@ -1083,8 +1083,22 @@ public actor OllamaService: AIEngineProtocol {
             throw OllamaServiceError.invalidResponse
         }
 
+        // Some reasoning-model gateways (DeepSeek, OpenRouter, vLLM with R1/QwQ)
+        // return chain-of-thought in a separate `reasoning_content` field rather
+        // than wrapped in inline `<think>` tags. Inline-wrap it so the rest of
+        // the pipeline (ThinkingStripper.combine, MessageBubble parser) can
+        // surface it as the disclosure block.
+        let mergedContent: String?
+        let reply = choice.message.content ?? ""
+        let reasoning = choice.message.reasoningContent?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !reasoning.isEmpty {
+            mergedContent = "<think>\n\(reasoning)\n</think>\n\(reply)"
+        } else {
+            mergedContent = choice.message.content
+        }
+
         return ParsedChunk(
-            content: choice.message.content,
+            content: mergedContent,
             done: true,
             toolCalls: choice.message.toolCalls?.compactMap { toolCall in
                 guard let arguments = toolCall.function.arguments else {
@@ -1221,12 +1235,26 @@ public actor OllamaService: AIEngineProtocol {
         struct Message: Decodable {
             let role: String
             let content: String?
+            let reasoningContent: String?
             let toolCalls: [ToolCall]?
 
             private enum CodingKeys: String, CodingKey {
                 case role
                 case content
+                case reasoningContent = "reasoning_content"
+                case reasoning
                 case toolCalls = "tool_calls"
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                role = try container.decode(String.self, forKey: .role)
+                content = try container.decodeIfPresent(String.self, forKey: .content)
+                // DeepSeek/QwQ-style APIs use `reasoning_content`; some gateways
+                // (OpenRouter, certain vLLM configs) use `reasoning`. Accept both.
+                reasoningContent = (try? container.decodeIfPresent(String.self, forKey: .reasoningContent))
+                    ?? (try? container.decodeIfPresent(String.self, forKey: .reasoning))
+                toolCalls = try container.decodeIfPresent([ToolCall].self, forKey: .toolCalls)
             }
         }
 

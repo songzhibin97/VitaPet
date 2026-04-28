@@ -123,45 +123,109 @@ struct CreateGroupView: View {
     @State private var selectedMembers: Set<UUID> = []
 
     var body: some View {
-        VStack(spacing: 18) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(L10n.chatCreateGroup)
-                    .font(.title2.weight(.semibold))
-                Text("把多只宠物放进同一个会话里。")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(spacing: 20) {
+            HStack(alignment: .top, spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.accentColor,
+                                    Color.accentColor.opacity(0.72)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .shadow(color: Color.accentColor.opacity(0.3), radius: 6, x: 0, y: 3)
 
-            VStack(alignment: .leading, spacing: 10) {
+                    Image(systemName: "person.3.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+                .frame(width: 44, height: 44)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(L10n.chatCreateGroup)
+                        .font(.title3.weight(.semibold))
+                    Text("把多只宠物放进同一个会话里。")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
                 Text(L10n.chatGroupName)
-                    .font(.headline)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
                 TextField(L10n.chatGroupNamePlaceholder, text: $groupName)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color(nsColor: .textBackgroundColor))
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(Color.primary.opacity(0.1), lineWidth: 1)
+                    }
             }
 
-            VStack(alignment: .leading, spacing: 10) {
-                Text(L10n.chatSelectMembers)
-                    .font(.headline)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(L10n.chatSelectMembers)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(selectedMembers.count) / \(availablePets.count)")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.tertiary)
+                }
 
                 ScrollView {
-                    VStack(spacing: 10) {
+                    VStack(spacing: 6) {
                         ForEach(availablePets, id: \.id) { pet in
+                            let isSelected = selectedMembers.contains(pet.id)
                             HStack(spacing: 10) {
-                                Image(systemName: selectedMembers.contains(pet.id) ? "checkmark.circle.fill" : "circle")
-                                    .foregroundStyle(selectedMembers.contains(pet.id) ? Color.accentColor : .secondary)
+                                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary.opacity(0.6))
                                 Text(pet.name)
+                                    .font(.subheadline)
+                                    .foregroundStyle(isSelected ? Color.primary : Color.primary.opacity(0.85))
                                 Spacer()
                             }
                             .padding(.horizontal, 12)
                             .padding(.vertical, 10)
                             .background(
-                                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                    .fill(selectedMembers.contains(pet.id) ? Color.accentColor.opacity(0.1) : Color.black.opacity(0.035))
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(
+                                        isSelected
+                                            ? AnyShapeStyle(
+                                                LinearGradient(
+                                                    colors: [
+                                                        Color.accentColor.opacity(0.18),
+                                                        Color.accentColor.opacity(0.08)
+                                                    ],
+                                                    startPoint: .topLeading,
+                                                    endPoint: .bottomTrailing
+                                                )
+                                            )
+                                            : AnyShapeStyle(Color(nsColor: .textBackgroundColor).opacity(0.6))
+                                    )
                             )
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .stroke(
+                                        isSelected ? Color.accentColor.opacity(0.4) : Color.primary.opacity(0.08),
+                                        lineWidth: 1
+                                    )
+                            }
                             .contentShape(Rectangle())
                             .onTapGesture {
-                                if selectedMembers.contains(pet.id) {
+                                if isSelected {
                                     selectedMembers.remove(pet.id)
                                 } else {
                                     selectedMembers.insert(pet.id)
@@ -169,26 +233,29 @@ struct CreateGroupView: View {
                             }
                         }
                     }
+                    .padding(.vertical, 2)
                 }
                 .frame(maxHeight: 240)
             }
 
-            HStack {
+            HStack(spacing: 10) {
                 Button(L10n.settingsPetManagementCancel) {
                     onCancel()
                 }
+                .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button(L10n.chatCreateGroup) {
                     let trimmedName = groupName.trimmingCharacters(in: .whitespacesAndNewlines)
                     let name = trimmedName.isEmpty ? "Group" : trimmedName
                     onCreate(name, Array(selectedMembers))
                 }
+                .keyboardShortcut(.defaultAction)
                 .disabled(selectedMembers.count < 2)
                 .buttonStyle(.borderedProminent)
             }
         }
         .padding(24)
-        .frame(width: 360)
+        .frame(width: 380)
         .onAppear {
             selectedMembers = Set(availablePets.map(\.id))
         }

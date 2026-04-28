@@ -123,6 +123,19 @@ private enum PluginTemplateOption: String, CaseIterable, Identifiable {
     }
 }
 
+private enum AISystemPromptEditor {
+    /// 达到该字符数后允许纵向滚动，较短时关闭以避免空白区域仍可拖动。
+    private static let scrollCharacterThreshold = 96
+    /// 显式换行达到该「行数」后也允许滚动（避免仅按字数时多行短句无法滚动）。
+    private static let scrollLineCountThreshold = 5
+
+    static func allowsVerticalScroll(for text: String) -> Bool {
+        if text.count >= scrollCharacterThreshold { return true }
+        let lineCount = text.split(separator: "\n", omittingEmptySubsequences: false).count
+        return lineCount >= scrollLineCountThreshold
+    }
+}
+
 private enum SettingsScope: String, CaseIterable, Identifiable {
     case all
     case pet
@@ -597,7 +610,7 @@ public struct SettingsView: View {
 
                                 Spacer()
 
-                                Button {
+                                Button(L10n.settingsPetManagementSave) {
                                     pendingPetSoundSaveTask?.cancel()
                                     let normalizedName = normalizedPetName(editName, fallback: pet.name)
                                     onUpdatePet(
@@ -612,15 +625,9 @@ public struct SettingsView: View {
                                     )
                                     refreshPetProfiles()
                                     editingPetID = nil
-                                } label: {
-                                    Text(L10n.settingsPetManagementSave)
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 4)
-                                        .background(Color.accentColor)
-                                        .foregroundStyle(.white)
-                                        .clipShape(RoundedRectangle(cornerRadius: 6))
                                 }
-                                .buttonStyle(.borderless)
+                                .buttonStyle(.borderedProminent)
+                                .keyboardShortcut(.defaultAction)
                             }
                         }
                         .padding(.vertical, 4)
@@ -995,7 +1002,7 @@ public struct SettingsView: View {
 
                     if aiBackend == .openAICompatible {
                         LabeledContent("API 密钥") {
-                            SecureField("sk-…（可留空，本地网关无需鉴权）", text: $openAIApiKey)
+                            SecureField("sk-…", text: $openAIApiKey)
                                 .textFieldStyle(.roundedBorder)
                                 .onChange(of: openAIApiKey) { _, _ in
                                     scheduleAIConfigSave()
@@ -1019,6 +1026,7 @@ public struct SettingsView: View {
                             TextEditor(text: $aiSystemPrompt)
                                 .font(.body)
                                 .frame(minHeight: 96)
+                                .scrollDisabled(!AISystemPromptEditor.allowsVerticalScroll(for: aiSystemPrompt))
                                 .onChange(of: aiSystemPrompt) { _, _ in
                                     scheduleAIConfigSave()
                                 }
@@ -1717,32 +1725,52 @@ public struct SettingsView: View {
         isExpanded: Binding<Bool>,
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 8) {
             Button {
-                withAnimation { isExpanded.wrappedValue.toggle() }
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.wrappedValue.toggle()
+                }
             } label: {
-                HStack {
+                HStack(spacing: 10) {
                     Image(systemName: icon)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 18)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 22, height: 22)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color.accentColor.opacity(0.12))
+                        )
                     Text(title)
-                        .font(.subheadline.weight(.medium))
+                        .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
                     Spacer()
-                    Text(isExpanded.wrappedValue ? "收起 ▲" : "展开 ▼")
-                        .font(.caption)
-                        .foregroundStyle(Color.accentColor)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded.wrappedValue ? 0 : -90))
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
             .buttonStyle(.plain)
-            .padding(.vertical, 4)
 
             if isExpanded.wrappedValue {
                 VStack(alignment: .leading, spacing: 8) {
                     content()
                 }
-                .padding(.leading, 26)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.primary.opacity(0.035))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
         }
     }
 
@@ -2021,20 +2049,23 @@ private struct DesktopAwarenessRuleEditor: View {
 
                 Spacer()
 
-                Button(isExpanded ? "收起" : "编辑") {
-                    isExpanded.toggle()
-                }
-                .buttonStyle(.borderless)
-
                 Button(role: .destructive, action: onDelete) {
                     Image(systemName: "trash")
                         .foregroundStyle(.red)
                 }
                 .buttonStyle(.borderless)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isExpanded ? 0 : -90))
+                    .animation(.easeInOut(duration: 0.18), value: isExpanded)
             }
             .contentShape(Rectangle())
             .onTapGesture {
-                isExpanded.toggle()
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
             }
 
             if isExpanded {
@@ -2228,9 +2259,15 @@ private struct LanguagePackEditor: View {
                         }
                         .buttonStyle(.borderless)
                     }
-                    .padding(8)
-                    .background(Color.secondary.opacity(0.06))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .padding(10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.primary.opacity(0.035))
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                    }
                 }
             }
 
@@ -2446,15 +2483,27 @@ private struct PluginTriggerEditor: View {
                                         valuePlaceholder: "值"
                                     )
                                 }
-                                .padding(8)
-                                .background(Color.secondary.opacity(0.06))
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                .padding(10)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(Color.primary.opacity(0.04))
+                                )
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                                }
                             }
                         }
                     }
-                    .padding(10)
-                    .background(Color.secondary.opacity(0.06))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .padding(12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.primary.opacity(0.035))
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                    }
                 }
 
                 Button {
