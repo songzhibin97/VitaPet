@@ -9,7 +9,7 @@ import Foundation
 // Usage: generate_icon.swift [emoji-ignored] [output.icns]
 //   Run from the VitaPet repository root (as build_app.sh does).
 
-let outputPath = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "AppIcon.icns"
+let outputPath = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "App/Resources/AppIcon.icns"
 
 let sizes: [(px: Int, name: String)] = [
     (16, "icon_16x16.png"),
