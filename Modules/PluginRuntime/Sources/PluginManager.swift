@@ -319,11 +319,6 @@ await handleAnimationRequest(state)
         event: AppEvent
     ) -> Bool {
         switch handle.manifest.id {
-        case "com.vitapet.hourly-chime":
-            guard case .timerFired = event else {
-                return false
-            }
-            return Calendar.current.component(.minute, from: Date()) == 0
         case "com.vitapet.birthday":
             guard case .timerFired = event else {
                 return false

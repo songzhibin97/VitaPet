@@ -2467,11 +2467,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         try FileManager.default.createDirectory(at: pluginsDirectory, withIntermediateDirectories: true)
 
-        // 逐个检查，缺的才安装
         for plugin in Self.builtInDeclarativePlugins {
             let pluginDir = pluginsDirectory.appendingPathComponent(plugin.directoryName, isDirectory: true)
             let manifestPath = pluginDir.appendingPathComponent("plugin.json")
-            if !FileManager.default.fileExists(atPath: manifestPath.path) {
+            var needsWrite = !FileManager.default.fileExists(atPath: manifestPath.path)
+            if !needsWrite,
+               let data = try? Data(contentsOf: manifestPath),
+               let existing = try? JSONDecoder().decode(PluginManifest.self, from: data) {
+                needsWrite = existing.version != plugin.manifest.version
+            } else if !needsWrite {
+                // Exists but malformed — refresh from embedded manifest.
+                needsWrite = true
+            }
+            if needsWrite {
                 try writePluginManifest(plugin.manifest, to: pluginDir)
             }
         }
@@ -2826,8 +2834,8 @@ extension AppDelegate {
             PluginManifest(
                 id: "com.vitapet.sit-reminder",
                 name: "久坐提醒",
-                version: "1.0",
-                description: "每45分钟提醒你站起来活动",
+                version: "1.0.1",
+                description: "每30分钟提醒你站起来活动",
                 capabilities: [],
                 triggers: [
                     TriggerRule(
@@ -2868,13 +2876,13 @@ extension AppDelegate {
             PluginManifest(
                 id: "com.vitapet.hourly-chime",
                 name: "整点报时",
-                version: "1.0",
+                version: "1.0.1",
                 description: "每小时报时",
                 capabilities: [],
                 triggers: [
                     TriggerRule(
                         event: "timerFired",
-                        conditions: [:],
+                        conditions: ["id": "hour-boundary"],
                         actions: [
                             PluginAction(type: "animation", state: "alert"),
                             PluginAction(type: "bubble", message: "现在是 {hour} 点~⏰")
