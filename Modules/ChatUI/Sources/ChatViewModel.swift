@@ -173,14 +173,23 @@ public final class ChatViewModel {
         appendToCurrentConversation(ChatMessage(role: .user, content: trimmedContent))
     }
 
-    public func addAssistantMessage(_ content: String, petId: UUID? = nil, petName: String? = nil) {
+    public func addAssistantMessage(
+        _ content: String,
+        petId: UUID? = nil,
+        petName: String? = nil,
+        displayThinking: Bool = true
+    ) {
         let trimmedContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedContent.isEmpty else {
             return
         }
 
         ensureSelectedConversation()
-        appendToCurrentConversation(ChatMessage(role: .assistant, content: trimmedContent, petId: petId, petName: petName))
+        let message = ChatMessage(role: .assistant, content: trimmedContent, petId: petId, petName: petName)
+        if !displayThinking {
+            capturedShowThinking[message.id] = false
+        }
+        appendToCurrentConversation(message)
     }
 
     public func loadConversations(_ threads: [ConversationThread]) {

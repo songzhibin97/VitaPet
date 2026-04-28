@@ -1214,7 +1214,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 }
                             }
 
-                            let displayText = cleanText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let displayText = ThinkingStripper.strip(cleanText)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
                             if !displayText.isEmpty {
                                 if isGroupChat {
                                     let petResponses = Self.parsePetResponses(from: displayText)
@@ -1223,15 +1224,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                         for (id, controller) in self.petWindowControllers where effectiveTargetPetIDs.contains(id) {
                                             controller.showAIBubble(displayText)
                                         }
-                                        chatViewModel.addAssistantMessage(displayText)
+                                        chatViewModel.addAssistantMessage(displayText, displayThinking: false)
                                     } else {
                                         for (petName, message) in petResponses {
+                                            let strippedMessage = ThinkingStripper.strip(message)
+                                                .trimmingCharacters(in: .whitespacesAndNewlines)
                                             let pet = targetPets.first(where: { $0.name == petName })
                                             if let pet,
                                                let controller = self.petWindowControllers[pet.id] {
-                                                controller.showAIBubble(message)
+                                                controller.showAIBubble(strippedMessage)
                                             }
-                                            chatViewModel.addAssistantMessage(message, petId: pet?.id, petName: petName)
+                                            chatViewModel.addAssistantMessage(
+                                                strippedMessage,
+                                                petId: pet?.id,
+                                                petName: petName,
+                                                displayThinking: false
+                                            )
                                         }
                                     }
                                 } else {
@@ -1242,7 +1250,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     chatViewModel.addAssistantMessage(
                                         displayText,
                                         petId: targetPet?.id,
-                                        petName: targetPet?.name
+                                        petName: targetPet?.name,
+                                        displayThinking: false
                                     )
                                 }
 
