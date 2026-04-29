@@ -15,7 +15,7 @@ final class PluginLoaderTests: XCTestCase {
     }
 
     func testDiscoverFindsVitapluginBundles() throws {
-        let loader = PluginLoader(developerMode: true)
+        let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: tempDir)
         try createPluginBundle(named: "First.vitaplugin", manifestId: "com.vitapet.first")
         try createPluginBundle(named: "Second.vitaplugin", manifestId: "com.vitapet.second")
 
@@ -25,7 +25,7 @@ final class PluginLoaderTests: XCTestCase {
     }
 
     func testDiscoverIgnoresNonPluginDirectories() throws {
-        let loader = PluginLoader(developerMode: true)
+        let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: tempDir)
         try createPluginBundle(named: "Valid.vitaplugin", manifestId: "com.vitapet.valid")
         try FileManager.default.createDirectory(
             at: tempDir.appendingPathComponent("NotAPlugin", isDirectory: true),
@@ -39,7 +39,7 @@ final class PluginLoaderTests: XCTestCase {
     }
 
     func testDiscoverFindsDeclarativePluginDirectories() throws {
-        let loader = PluginLoader(developerMode: true)
+        let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: tempDir)
         try createPluginBundle(named: "Valid.vitaplugin", manifestId: "com.vitapet.valid")
         try createDeclarativePluginDirectory(named: "JSONOnly", manifestId: "com.vitapet.json-only")
 
@@ -49,7 +49,7 @@ final class PluginLoaderTests: XCTestCase {
     }
 
     func testLoadReturnsPluginBundle() throws {
-        let loader = PluginLoader(developerMode: true)
+        let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: tempDir)
         let bundleURL = try createPluginBundle(named: "Loadable.vitaplugin", manifestId: "com.vitapet.loadable")
 
         let bundle = try loader.load(bundleAt: bundleURL)
@@ -60,7 +60,7 @@ final class PluginLoaderTests: XCTestCase {
     }
 
     func testLoadAllowsManifestOnlyBundle() throws {
-        let loader = PluginLoader(developerMode: true)
+        let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: tempDir)
         let bundleURL = tempDir.appendingPathComponent("ManifestOnly.vitaplugin", isDirectory: true)
         try FileManager.default.createDirectory(
             at: bundleURL.appendingPathComponent("Contents/Resources", isDirectory: true),
@@ -76,7 +76,7 @@ final class PluginLoaderTests: XCTestCase {
     }
 
     func testLoadAllowsDeclarativePluginDirectory() throws {
-        let loader = PluginLoader(developerMode: true)
+        let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: tempDir)
         let bundleURL = try createDeclarativePluginDirectory(named: "Declarative", manifestId: "com.vitapet.declarative")
 
         let bundle = try loader.load(bundleAt: bundleURL)
@@ -87,7 +87,7 @@ final class PluginLoaderTests: XCTestCase {
     }
 
     func testLoadThrowsMissingManifest() throws {
-        let loader = PluginLoader(developerMode: true)
+        let loader = PluginLoader(developerMode: false)
         let bundleURL = tempDir.appendingPathComponent("MissingManifest.vitaplugin", isDirectory: true)
         try FileManager.default.createDirectory(at: bundleURL, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(
@@ -107,7 +107,7 @@ final class PluginLoaderTests: XCTestCase {
     }
 
     func testLoadThrowsMalformedManifest() throws {
-        let loader = PluginLoader(developerMode: true)
+        let loader = PluginLoader(developerMode: false)
         let bundleURL = tempDir.appendingPathComponent("Malformed.vitaplugin", isDirectory: true)
         try FileManager.default.createDirectory(
             at: bundleURL.appendingPathComponent("Contents/Resources", isDirectory: true),
@@ -131,9 +131,122 @@ final class PluginLoaderTests: XCTestCase {
         }
     }
 
+    // MARK: - Release path (strict signature enforcement)
+
+    func testReleasePathRejectsUnsignedPlugin() throws {
+        // developerMode=false means no whitelist bypass; unsigned .vitaplugin must be rejected.
+        let loader = PluginLoader(developerMode: false)
+        let bundleURL = try createPluginBundle(named: "Unsigned.vitaplugin", manifestId: "com.vitapet.unsigned")
+
+        XCTAssertThrowsError(try loader.load(bundleAt: bundleURL)) { error in
+            switch error {
+            case PluginLoader.LoadError.signatureInvalid, PluginLoader.LoadError.signatureVerificationFailed:
+                break  // expected
+            default:
+                XCTFail("Expected signature error, got: \(error)")
+            }
+        }
+    }
+
+    // MARK: - DEBUG path with whitelist
+
+    func testDebugPathAllowsUnsignedPluginInsideWhitelist() throws {
+        // developerMode=true + plugin inside whitelist directory → signature skipped.
+        let devDir = tempDir.appendingPathComponent("dev", isDirectory: true)
+        try FileManager.default.createDirectory(at: devDir, withIntermediateDirectories: true)
+        let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: devDir)
+        let bundleURL = try createPluginBundle(named: "DevPlugin.vitaplugin", manifestId: "com.vitapet.dev", inDirectory: devDir)
+
+        XCTAssertNoThrow(try loader.load(bundleAt: bundleURL))
+    }
+
+    func testDebugPathRejectsUnsignedPluginOutsideWhitelist() throws {
+        // developerMode=true but plugin is in a different directory → strict validation applies.
+        let devDir = tempDir.appendingPathComponent("dev", isDirectory: true)
+        try FileManager.default.createDirectory(at: devDir, withIntermediateDirectories: true)
+        let otherDir = tempDir.appendingPathComponent("other", isDirectory: true)
+        try FileManager.default.createDirectory(at: otherDir, withIntermediateDirectories: true)
+
+        let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: devDir)
+        let bundleURL = try createPluginBundle(named: "Outside.vitaplugin", manifestId: "com.vitapet.outside", inDirectory: otherDir)
+
+        XCTAssertThrowsError(try loader.load(bundleAt: bundleURL)) { error in
+            switch error {
+            case PluginLoader.LoadError.signatureInvalid, PluginLoader.LoadError.signatureVerificationFailed:
+                break  // expected
+            default:
+                XCTFail("Expected signature error, got: \(error)")
+            }
+        }
+    }
+
+    func testDebugPathRejectsSymlinkBypassOutsideWhitelist() throws {
+        // A symlink inside the whitelist directory pointing to a bundle outside it must
+        // not bypass signature verification (resolvingSymlinksInPath defeats this).
+        let devDir = tempDir.appendingPathComponent("dev", isDirectory: true)
+        try FileManager.default.createDirectory(at: devDir, withIntermediateDirectories: true)
+        let outsideDir = tempDir.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+
+        // The real (unsigned) plugin lives outside the whitelist.
+        let realBundle = try createPluginBundle(
+            named: "Real.vitaplugin",
+            manifestId: "com.vitapet.symlink-target",
+            inDirectory: outsideDir
+        )
+
+        // Place a symlink to it inside the whitelist directory.
+        let symlinkURL = devDir.appendingPathComponent("SymlinkedPlugin.vitaplugin", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: symlinkURL, withDestinationURL: realBundle)
+
+        let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: devDir)
+
+        // Loading via the symlink must fail because the resolved path is outside the whitelist.
+        XCTAssertThrowsError(try loader.load(bundleAt: symlinkURL)) { error in
+            switch error {
+            case PluginLoader.LoadError.signatureInvalid, PluginLoader.LoadError.signatureVerificationFailed:
+                break  // expected – symlink was resolved before whitelist check
+            default:
+                XCTFail("Expected signature error (symlink bypass prevented), got: \(error)")
+            }
+        }
+    }
+
+    func testDebugPathDoesNotMatchPrefixBoundaryMismatch() throws {
+        // Whitelist=/foo/dev must NOT match a plugin at /foo/devil (prefix boundary).
+        let devDir = tempDir.appendingPathComponent("dev", isDirectory: true)
+        try FileManager.default.createDirectory(at: devDir, withIntermediateDirectories: true)
+        // "devil" shares the same prefix as "dev" but is a sibling, not a child.
+        let devilDir = tempDir.appendingPathComponent("devil", isDirectory: true)
+        try FileManager.default.createDirectory(at: devilDir, withIntermediateDirectories: true)
+
+        let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: devDir)
+        let bundleURL = try createPluginBundle(
+            named: "Trickster.vitaplugin",
+            manifestId: "com.vitapet.trickster",
+            inDirectory: devilDir
+        )
+
+        XCTAssertThrowsError(try loader.load(bundleAt: bundleURL)) { error in
+            switch error {
+            case PluginLoader.LoadError.signatureInvalid, PluginLoader.LoadError.signatureVerificationFailed:
+                break  // expected
+            default:
+                XCTFail("Expected signature error (prefix boundary), got: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Private helpers
+
     @discardableResult
     private func createPluginBundle(named bundleName: String, manifestId: String) throws -> URL {
-        let bundleURL = tempDir.appendingPathComponent(bundleName, isDirectory: true)
+        try createPluginBundle(named: bundleName, manifestId: manifestId, inDirectory: tempDir)
+    }
+
+    @discardableResult
+    private func createPluginBundle(named bundleName: String, manifestId: String, inDirectory directory: URL) throws -> URL {
+        let bundleURL = directory.appendingPathComponent(bundleName, isDirectory: true)
         try FileManager.default.createDirectory(
             at: bundleURL.appendingPathComponent("Contents/Resources", isDirectory: true),
             withIntermediateDirectories: true

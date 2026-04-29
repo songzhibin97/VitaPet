@@ -1,4 +1,5 @@
 import ChatUI
+import Persistence
 import XCTest
 
 @MainActor
@@ -164,12 +165,12 @@ final class ChatViewModelTests: XCTestCase {
         let expectation = XCTestExpectation(description: "assistant replied")
         let viewModel = ChatViewModel(
             sendToAI: { _, _ in
-                AsyncThrowingStream { continuation in
+                (streamID: UUID(), stream: AsyncThrowingStream { continuation in
                     continuation.yield("Hello")
                     continuation.yield(", ")
                     continuation.yield("World")
                     continuation.finish()
-                }
+                })
             },
             getAIStatus: { .ready }
         )
@@ -189,10 +190,10 @@ final class ChatViewModelTests: XCTestCase {
         let expectation = XCTestExpectation(description: "assistant replied")
         let viewModel = ChatViewModel(
             sendToAI: { _, _ in
-                AsyncThrowingStream { continuation in
+                (streamID: UUID(), stream: AsyncThrowingStream { continuation in
                     continuation.yield("reply")
                     continuation.finish()
-                }
+                })
             },
             getAIStatus: { .ready }
         )
@@ -215,10 +216,10 @@ final class ChatViewModelTests: XCTestCase {
         let replyExpectation = XCTestExpectation(description: "assistant replied")
         let viewModel = ChatViewModel(
             sendToAI: { input, _ in
-                AsyncThrowingStream { continuation in
+                (streamID: UUID(), stream: AsyncThrowingStream { continuation in
                     continuation.yield("reply to \(input)")
                     continuation.finish()
-                }
+                })
             },
             getAIStatus: { .ready }
         )

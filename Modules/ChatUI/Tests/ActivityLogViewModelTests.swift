@@ -155,6 +155,16 @@ final class ActivityLogViewModelTests: XCTestCase {
         XCTAssertEqual(entry.summary, "无附加信息")
     }
 
+    func testIsPersistenceAvailable_defaultsTrue() {
+        let viewModel = ActivityLogViewModel(loadEvents: { _, _ in [] })
+        XCTAssertTrue(viewModel.isPersistenceAvailable)
+    }
+
+    func testIsPersistenceAvailable_falseWhenPassedFalse() {
+        let viewModel = ActivityLogViewModel(isPersistenceAvailable: false, loadEvents: { _, _ in [] })
+        XCTAssertFalse(viewModel.isPersistenceAvailable)
+    }
+
     private func makeViewModel(
         pageSize: Int,
         loader: EventLoaderStub

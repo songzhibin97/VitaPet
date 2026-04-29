@@ -143,6 +143,6 @@ public extension OllamaTool {
 
 /// AI 引擎协议（Phase 2 实现）
 public protocol AIEngineProtocol: Sendable {
-    func send(message: String) async throws -> AsyncThrowingStream<String, Error>
+    func send(message: String) async throws -> (streamID: UUID, stream: AsyncThrowingStream<String, Error>)
     var status: AIEngineStatus { get async }
 }

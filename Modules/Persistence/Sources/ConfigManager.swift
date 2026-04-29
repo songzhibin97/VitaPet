@@ -1,4 +1,15 @@
 import Foundation
+import SecurityLayer
+
+// MARK: - KeychainStoring protocol (enables test injection of failing mocks)
+
+/// Minimal async interface consumed by ConfigManager. `KeychainManager` conforms below.
+protocol KeychainStoring: Actor {
+    func setString(_ value: String, forKey key: String) async throws
+    func getString(forKey key: String) async throws -> String?
+}
+
+extension KeychainManager: KeychainStoring {}
 
 @MainActor
 public final class ConfigManager {
@@ -16,11 +27,18 @@ public final class ConfigManager {
         public var aiSystemPrompt: String
         public var aiProactiveEnabled: Bool
         public var aiProactiveInterval: Int
+        /// Legacy field — retained for decoding old plist only.
+        /// Authoritative value lives in Keychain. Always written as "" on save.
         public var githubToken: String
         public var webhookEnabled: Bool
         public var webhookPort: Int
+        /// Legacy field — retained for decoding old plist only.
+        /// Authoritative value lives in Keychain. Always written as "" on save.
         public var webhookSecret: String
         public var spaceMode: String  // "allSpaces", "follow", "singleSpace"
+        public var aiTemperature: Double
+        public var aiTopP: Double
+        public var aiNumCtx: Int
 
         public init(
             windowPositionX: Double,
@@ -40,7 +58,10 @@ public final class ConfigManager {
             webhookEnabled: Bool = false,
             webhookPort: Int = 19280,
             webhookSecret: String = "",
-            spaceMode: String = "allSpaces"
+            spaceMode: String = "allSpaces",
+            aiTemperature: Double = 0.7,
+            aiTopP: Double = 0.9,
+            aiNumCtx: Int = 4096
         ) {
             let resolvedPets = Self.resolvePets(
                 pets,
@@ -69,6 +90,9 @@ public final class ConfigManager {
             self.webhookPort = webhookPort
             self.webhookSecret = webhookSecret
             self.spaceMode = spaceMode
+            self.aiTemperature = aiTemperature
+            self.aiTopP = aiTopP
+            self.aiNumCtx = aiNumCtx
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -90,6 +114,9 @@ public final class ConfigManager {
             case webhookPort
             case webhookSecret
             case spaceMode
+            case aiTemperature
+            case aiTopP
+            case aiNumCtx
         }
 
         public init(from decoder: Decoder) throws {
@@ -126,6 +153,9 @@ public final class ConfigManager {
             webhookPort = try container.decodeIfPresent(Int.self, forKey: .webhookPort) ?? 19280
             webhookSecret = try container.decodeIfPresent(String.self, forKey: .webhookSecret) ?? ""
             spaceMode = try container.decodeIfPresent(String.self, forKey: .spaceMode) ?? "allSpaces"
+            aiTemperature = try container.decodeIfPresent(Double.self, forKey: .aiTemperature) ?? 0.7
+            aiTopP = try container.decodeIfPresent(Double.self, forKey: .aiTopP) ?? 0.9
+            aiNumCtx = try container.decodeIfPresent(Int.self, forKey: .aiNumCtx) ?? 4096
         }
 
         mutating func synchronizeLegacyFields() {
@@ -188,14 +218,38 @@ public final class ConfigManager {
         }
     }
 
+    // MARK: - Keychain keys
+    private enum KeychainKey {
+        static let githubToken = "githubToken"
+        static let webhookSecret = "webhookSecret"
+    }
+
     public private(set) var config: AppConfig
     private let applicationSupportDirectoryURL: URL
     private let configFileURL: URL
+    private let keychain: any KeychainStoring
+
+    /// In-memory cache for the github token (populated by `create` or explicit `setGithubToken`).
+    /// Allows sync read from @MainActor context without async hop.
+    private var cachedGithubToken: String = ""
+    /// In-memory cache for the webhook secret.
+    private var cachedWebhookSecret: String = ""
+
+    // MARK: - Designated initializer (internal use + test injection)
+    init(initialConfig: AppConfig, storageURL: URL, keychain: any KeychainStoring) {
+        self.config = initialConfig
+        self.applicationSupportDirectoryURL = storageURL
+        self.configFileURL = storageURL.appendingPathComponent("config.plist")
+        self.keychain = keychain
+    }
+
+    // MARK: - Legacy sync initializers (preserved for existing test compatibility)
 
     public init() {
         let storageURL = Self.defaultStorageURL()
         self.applicationSupportDirectoryURL = storageURL
         self.configFileURL = storageURL.appendingPathComponent("config.plist")
+        self.keychain = KeychainManager()
         self.config = Self.load(storageURL: storageURL)
     }
 
@@ -203,21 +257,88 @@ public final class ConfigManager {
         let storageURL = Self.defaultStorageURL()
         self.applicationSupportDirectoryURL = storageURL
         self.configFileURL = storageURL.appendingPathComponent("config.plist")
+        self.keychain = KeychainManager()
         self.config = config
     }
 
     public init(storageURL: URL) {
         self.applicationSupportDirectoryURL = storageURL
         self.configFileURL = storageURL.appendingPathComponent("config.plist")
+        self.keychain = KeychainManager()
         self.config = Self.load(storageURL: storageURL)
     }
+
+    // MARK: - Async factory (preferred for production bootstrap)
+
+    /// Creates a ConfigManager, migrating any legacy plist credentials to Keychain,
+    /// and warming the in-memory cache from Keychain.
+    public static func create(
+        storageURL: URL = defaultStorageURL(),
+        keychain: KeychainManager = KeychainManager()
+    ) async -> ConfigManager {
+        await create(storageURL: storageURL, keychainStoring: keychain)
+    }
+
+    /// Internal overload that accepts any `KeychainStoring` implementation.
+    /// Used by tests to inject a failing or mock keychain.
+    static func create(
+        storageURL: URL = defaultStorageURL(),
+        keychainStoring keychain: any KeychainStoring
+    ) async -> ConfigManager {
+        let (loadedConfig, pendingMigration) = await loadWithMigrationData(storageURL: storageURL)
+        let manager = ConfigManager(initialConfig: loadedConfig, storageURL: storageURL, keychain: keychain)
+        await manager.performMigrationIfNeeded(pendingMigration)
+        // Warm the cache after potential migration
+        await manager.warmCache()
+        return manager
+    }
+
+    // MARK: - Keychain accessors (async — authoritative source)
+
+    public func githubToken() async -> String {
+        let value = (try? await keychain.getString(forKey: KeychainKey.githubToken)) ?? ""
+        cachedGithubToken = value
+        return value
+    }
+
+    public func setGithubToken(_ value: String) async throws {
+        try await keychain.setString(value, forKey: KeychainKey.githubToken)
+        cachedGithubToken = value
+    }
+
+    public func webhookSecret() async -> String {
+        let value = (try? await keychain.getString(forKey: KeychainKey.webhookSecret)) ?? ""
+        cachedWebhookSecret = value
+        return value
+    }
+
+    public func setWebhookSecret(_ value: String) async throws {
+        try await keychain.setString(value, forKey: KeychainKey.webhookSecret)
+        cachedWebhookSecret = value
+    }
+
+    // MARK: - Sync cache reads (for use in @MainActor sync closures)
+
+    /// Synchronous read of github token from in-memory cache.
+    /// Always call `githubToken()` at least once after init, or use `create()`, to ensure this is populated.
+    public var cachedGithubTokenValue: String { cachedGithubToken }
+
+    /// Synchronous read of webhook secret from in-memory cache.
+    public var cachedWebhookSecretValue: String { cachedWebhookSecret }
+
+    // MARK: - Persist
 
     public func save() throws {
         try ensureApplicationSupportDirectoryExists()
 
+        // Sanitize: never write sensitive fields to plist
+        var sanitized = config
+        sanitized.githubToken = ""
+        sanitized.webhookSecret = ""
+
         let encoder = PropertyListEncoder()
         encoder.outputFormat = .xml
-        let data = try encoder.encode(config)
+        let data = try encoder.encode(sanitized)
         try data.write(to: configFileURL, options: .atomic)
     }
 
@@ -227,6 +348,8 @@ public final class ConfigManager {
         config.reconcileLegacyFields(afterUpdatingFrom: originalConfig)
         try save()
     }
+
+    // MARK: - Load (sync, for legacy inits)
 
     public static func load() -> AppConfig {
         load(storageURL: defaultStorageURL())
@@ -243,10 +366,77 @@ public final class ConfigManager {
             return defaultConfig()
         }
     }
+
+    // MARK: - Private helpers
+
+    /// Returns the loaded config along with any credentials that need migrating to Keychain.
+    /// Migration candidates: non-empty plist fields that haven't already been saved to Keychain.
+    private static func loadWithMigrationData(storageURL: URL) async -> (AppConfig, [String: String]) {
+        let cfg = load(storageURL: storageURL)
+        var pending: [String: String] = [:]
+        if !cfg.githubToken.isEmpty {
+            pending[KeychainKey.githubToken] = cfg.githubToken
+        }
+        if !cfg.webhookSecret.isEmpty {
+            pending[KeychainKey.webhookSecret] = cfg.webhookSecret
+        }
+        return (cfg, pending)
+    }
+
+    /// Writes pending credentials to Keychain (only if Keychain doesn't already have a value),
+    /// then rewrites plist with those fields blanked out. Idempotent.
+    ///
+    /// Safety invariants:
+    /// - A plist field is cleared **only** when Keychain is confirmed to hold a value for that key
+    ///   (either pre-existing or just written successfully). This prevents both:
+    ///   P0: plist plaintext residue when Keychain already had a value and didMigrate stayed false.
+    ///   P1: credential loss when a Keychain write fails silently.
+    private func performMigrationIfNeeded(_ pending: [String: String]) async {
+        guard !pending.isEmpty else { return }
+
+        // Track which keys are confirmed safe in Keychain (pre-existing OR freshly written).
+        var keysConfirmedInKeychain: Set<String> = []
+
+        for (key, value) in pending {
+            let existing = try? await keychain.getString(forKey: key)
+            if let existing, !existing.isEmpty {
+                // Keychain already holds a value — do not overwrite; still safe to clear plist.
+                keysConfirmedInKeychain.insert(key)
+            } else {
+                // Keychain is empty — attempt to migrate plist value.
+                do {
+                    try await keychain.setString(value, forKey: key)
+                    keysConfirmedInKeychain.insert(key)
+                } catch {
+                    // Write failed: keep plist value intact to avoid credential loss.
+                    AppLogger.error("Keychain migration failed for key '\(key)': \(error.localizedDescription)")
+                }
+            }
+        }
+
+        // Clear only the plist fields that are confirmed safe in Keychain.
+        if keysConfirmedInKeychain.contains(KeychainKey.githubToken) {
+            config.githubToken = ""
+        }
+        if keysConfirmedInKeychain.contains(KeychainKey.webhookSecret) {
+            config.webhookSecret = ""
+        }
+
+        // Persist if at least one field was sanitized.
+        if !keysConfirmedInKeychain.isEmpty {
+            try? save()
+        }
+    }
+
+    /// Populates the in-memory cache from Keychain.
+    private func warmCache() async {
+        cachedGithubToken = (try? await keychain.getString(forKey: KeychainKey.githubToken)) ?? ""
+        cachedWebhookSecret = (try? await keychain.getString(forKey: KeychainKey.webhookSecret)) ?? ""
+    }
 }
 
 extension ConfigManager {
-    nonisolated private static func defaultStorageURL() -> URL {
+    nonisolated public static func defaultStorageURL() -> URL {
         let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return baseURL.appendingPathComponent("VitaPet", isDirectory: true)
     }

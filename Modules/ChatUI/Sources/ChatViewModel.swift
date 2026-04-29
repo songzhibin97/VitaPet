@@ -1,6 +1,7 @@
 import Foundation
 import Localization
 import Observation
+import Persistence
 
 @MainActor
 @Observable
@@ -25,8 +26,10 @@ public final class ChatViewModel {
     public private(set) var isStreaming = false
     private var messagesByConversation: [String: [ChatMessage]] = [:]
 
-    private let sendToAI: @Sendable (String, [ChatMessage]) async throws -> AsyncThrowingStream<String, Error>
+    private let sendToAI: @Sendable (String, [ChatMessage]) async throws -> (streamID: UUID, stream: AsyncThrowingStream<String, Error>)
+    private let cancelStream: @Sendable (UUID) async -> Void
     private let getAIStatus: @Sendable () async -> AIEngineStatus
+    private var currentStreamID: UUID?
 
     public var onUserSent: (@MainActor () -> Void)?
     public var onAssistantReplied: (@MainActor () -> Void)?
@@ -35,19 +38,29 @@ public final class ChatViewModel {
     public var onDeleteConversation: (@MainActor (String) -> Void)?
 
     public init(
-        sendToAI: @escaping @Sendable (String, [ChatMessage]) async throws -> AsyncThrowingStream<String, Error> = { _, _ in
-            AsyncThrowingStream { continuation in
+        sendToAI: @escaping @Sendable (String, [ChatMessage]) async throws -> (streamID: UUID, stream: AsyncThrowingStream<String, Error>) = { _, _ in
+            (streamID: UUID(), stream: AsyncThrowingStream { continuation in
                 continuation.finish()
-            }
+            })
         },
+        cancelStream: @escaping @Sendable (UUID) async -> Void = { _ in },
         getAIStatus: @escaping @Sendable () async -> AIEngineStatus = { .notConfigured }
     ) {
         self.sendToAI = sendToAI
+        self.cancelStream = cancelStream
         self.getAIStatus = getAIStatus
         // Check AI status immediately on creation
         Task { @MainActor in
             self.aiStatus = await getAIStatus()
         }
+    }
+
+    /// Stop the currently active streaming response.
+    public func stopGeneration() {
+        guard let id = currentStreamID else { return }
+        currentStreamID = nil
+        let cancel = cancelStream
+        Task { await cancel(id) }
     }
 
     public func sendMessage() {
@@ -74,13 +87,15 @@ public final class ChatViewModel {
             isStreaming = true
             defer {
                 isStreaming = false
+                currentStreamID = nil
             }
 
             var assistantMessage = ChatMessage(role: .assistant, content: "")
             appendToCurrentConversation(assistantMessage)
 
             do {
-                let stream = try await sendToAI(trimmedInput, aiHistory)
+                let (streamID, stream) = try await sendToAI(trimmedInput, aiHistory)
+                currentStreamID = streamID
 
                 for try await chunk in stream {
                     guard let currentAssistantMessage = currentMessages.last else {

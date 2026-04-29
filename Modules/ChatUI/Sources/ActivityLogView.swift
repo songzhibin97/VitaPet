@@ -12,72 +12,97 @@ public struct ActivityLogView: View {
     }
 
     public var body: some View {
-        List {
-            if let errorMessage = activityLogViewModel.errorMessage {
-                Section {
-                    Text(errorMessage)
-                        .font(.subheadline)
-                        .foregroundStyle(.red)
-                        .padding(.vertical, 6)
-                }
+        VStack(spacing: 0) {
+            if !activityLogViewModel.isPersistenceAvailable {
+                PersistenceUnavailableBanner()
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
             }
 
-            Section(L10n.activityLogRecent) {
-                if activityLogViewModel.events.isEmpty, !activityLogViewModel.isLoading {
-                    Text(L10n.activityLogEmpty)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .padding(.vertical, 6)
-                } else {
-                    ForEach(activityLogViewModel.events) { entry in
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                                Text(
-                                    entry.timestamp,
-                                    format: Date.FormatStyle(
-                                        date: .numeric,
-                                        time: .standard
+            List {
+                if let errorMessage = activityLogViewModel.errorMessage {
+                    Section {
+                        Text(errorMessage)
+                            .font(.subheadline)
+                            .foregroundStyle(.red)
+                            .padding(.vertical, 6)
+                    }
+                }
+
+                Section(L10n.activityLogRecent) {
+                    if activityLogViewModel.events.isEmpty, !activityLogViewModel.isLoading {
+                        Text(L10n.activityLogEmpty)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 6)
+                    } else {
+                        ForEach(activityLogViewModel.events) { entry in
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                    Text(
+                                        entry.timestamp,
+                                        format: Date.FormatStyle(
+                                            date: .numeric,
+                                            time: .standard
+                                        )
                                     )
-                                )
-                                    .font(.caption)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+
+                                    Text(entry.source)
+                                        .font(.headline)
+                                }
+
+                                Text(entry.summary)
+                                    .font(.subheadline)
                                     .foregroundStyle(.secondary)
-
-                                Text(entry.source)
-                                    .font(.headline)
+                                    .textSelection(.enabled)
+                                    .lineLimit(3)
                             }
+                            .padding(.vertical, 6)
+                        }
 
-                            Text(entry.summary)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                                .lineLimit(3)
+                        if activityLogViewModel.isLoading {
+                            HStack {
+                                Spacer()
+                                ProgressView()
+                                Spacer()
+                            }
+                            .padding(.vertical, 8)
+                        } else if activityLogViewModel.canLoadMore {
+                            Button(L10n.activityLogLoadMore) {
+                                Task { await activityLogViewModel.loadMore() }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .center)
                         }
-                        .padding(.vertical, 6)
-                    }
-
-                    if activityLogViewModel.isLoading {
-                        HStack {
-                            Spacer()
-                            ProgressView()
-                            Spacer()
-                        }
-                        .padding(.vertical, 8)
-                    } else if activityLogViewModel.canLoadMore {
-                        Button(L10n.activityLogLoadMore) {
-                            Task { await activityLogViewModel.loadMore() }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .center)
                     }
                 }
             }
+            .listStyle(.inset)
+            .navigationTitle(L10n.activityLogTitle)
         }
-        .listStyle(.inset)
-        .navigationTitle(L10n.activityLogTitle)
         .frame(minWidth: 480, minHeight: 420)
         .task {
             if activityLogViewModel.events.isEmpty {
                 await activityLogViewModel.refresh()
             }
         }
+    }
+}
+
+private struct PersistenceUnavailableBanner: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.white)
+            Text("数据不可用 — 持久化未启用")
+                .font(.subheadline)
+                .foregroundStyle(.white)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.red)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }

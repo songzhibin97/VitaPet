@@ -8,6 +8,9 @@ import QuartzCore
 
 @MainActor
 public final class PetWindowController: NSWindowController {
+    // @unchecked Sendable is required to capture this mutable counter in a Timer callback
+    // closure, which is not actor-isolated. The Timer fires on the RunLoop that created it
+    // (main RunLoop), so mutations of `value` are always on the main thread.
     private final class TimerStepState: @unchecked Sendable {
         var value = 0
     }

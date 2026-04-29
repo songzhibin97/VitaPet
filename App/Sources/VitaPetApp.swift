@@ -3,6 +3,11 @@ import Foundation
 
 @main
 struct VitaPetApp {
+    // nonisolated(unsafe) is required because this POSIX file descriptor is opened in
+    // main() before any actor is established, written once (under the OS file lock),
+    // and then read from nonisolated releaseAppLock(). The descriptor is never mutated
+    // concurrently — the write happens in main() single-threaded startup and the read
+    // only in atexit / signal context — so this is data-race-free in practice.
     nonisolated(unsafe) private static var lockFileDescriptor: Int32 = -1
 
     nonisolated static func releaseAppLock() {

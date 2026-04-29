@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 
 @MainActor
-public final class WorkspaceMonitor: EventSource, @unchecked Sendable {
+public final class WorkspaceMonitor: EventSource, Sendable {
     public let sourceId: String = "workspace"
 
     private let notificationCenter: NotificationCenter

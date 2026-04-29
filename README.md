@@ -103,12 +103,12 @@ swift run VitaPetApp
 
 ## 4. 宠物管理
 
-VitaPet 支持最多同时管理 `3` 只宠物。
+VitaPet 支持最多同时管理 `5` 只宠物。
 
 ### 添加宠物
 
 - 操作路径：状态栏 `🐾` → `添加宠物`
-- 上限为 `3` 只；达到上限后无法继续添加
+- 上限为 `5` 只；达到上限后无法继续添加
 
 ### 删除宠物
 
@@ -139,14 +139,14 @@ VitaPet 支持最多同时管理 `3` 只宠物。
 
 ## 5. 动画与行为系统
 
-VitaPet 内置 `49` 种动画状态，支持心情驱动、自然过渡、移动行为和窗口附着行为。
+VitaPet 内置 `47` 种动画状态，支持心情驱动、自然过渡、移动行为和窗口附着行为。
 
 ### 动画状态完整列表
 
 | 分类 | 状态 |
 | --- | --- |
 | 基础 | `idle`、`walk`、`run`、`sit`、`sleep` |
-| 情绪 | `happy` / `sad` / `angry` / `shy` / `confused` / `scared` / `love` |
+| 情绪 | `sad` / `angry` / `shy` / `confused` / `scared` / `love` |
 | 互动 | `react`、`celebrate`、`wave`、`nod`、`chat`、`listen` |
 | 活动 | `eat`、`drink`、`groom`、`play`、`dance`、`spin`、`roll`、`bounce`、`climb` |
 | 工作 | `read`、`write`、`type`、`phone`、`think`、`alert` |
@@ -154,7 +154,6 @@ VitaPet 内置 `49` 种动画状态，支持心情驱动、自然过渡、移动
 
 说明：
 
-- `happy` 在产品层面表示高兴情绪状态
 - 实际动画资产主要由精灵包 `manifest.json` 提供；缺失时会回退到默认资源
 
 ### 行为引擎
@@ -710,7 +709,7 @@ VitaPet/
 | `Modules/FocusMonitor` | 专注状态与前台窗口监控 |
 | `Modules/Localization` | 多语言文案资源 |
 | `Modules/SecurityLayer` | 权限能力定义与访问控制 |
-| `Plugins/GitCelebrate` | 示例插件（预留，当前使用声明式 JSON 插件） |
+| `Plugins/GitCelebrate` | 原生插件示例（实验性，当前未启用；声明式 JSON 版本 `GitCelebrateJSON` 为实际使用的内置插件） |
 
 ## 20. 许可证
 

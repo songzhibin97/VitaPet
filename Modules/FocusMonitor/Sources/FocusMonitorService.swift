@@ -2,7 +2,7 @@ import EventBus
 import Foundation
 
 @MainActor
-public final class FocusMonitorService: @unchecked Sendable {
+public final class FocusMonitorService: Sendable {
     private let detector: any FullscreenDetecting
     private let eventBus: EventBus
     private var isInFocusMode: Bool = false

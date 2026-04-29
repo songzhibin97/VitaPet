@@ -9,6 +9,7 @@ public actor OllamaService: AIEngineProtocol {
     private var memories: [String] = []
     private var currentSessionId: String = "default"
     private var sessionHistories: [String: [ChatMessage]] = [:]
+    private var activeStreams: [UUID: Task<Void, Never>] = [:]
 
     private var activeHistory: [ChatMessage] {
         get { sessionHistories[currentSessionId] ?? [] }
@@ -35,12 +36,29 @@ public actor OllamaService: AIEngineProtocol {
 
     private var endpoint: URL
     private var model: String
+    private var chatOptions: ChatOptions?
     private var onConversationUpdated: (@Sendable (String, String, String, String?, String?) async -> Void)?
     private var currentStatus: AIEngineStatus = .notConfigured
+    private let urlSession: URLSession
+
+    private static func makeDefaultSession() -> URLSession {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 120
+        return URLSession(configuration: config)
+    }
 
     public init(endpoint: URL, model: String) {
         self.endpoint = endpoint
         self.model = model
+        self.urlSession = Self.makeDefaultSession()
+    }
+
+    /// Designated initialiser for testing — allows injecting a custom URLSession (e.g. with a mock URLProtocol).
+    init(endpoint: URL, model: String, urlSession: URLSession) {
+        self.endpoint = endpoint
+        self.model = model
+        self.urlSession = urlSession
     }
 
     public var status: AIEngineStatus {
@@ -56,7 +74,7 @@ public actor OllamaService: AIEngineProtocol {
             let url = endpoint.appendingPathComponent("api").appendingPathComponent("tags")
             let request = URLRequest(url: url)
 
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await urlSession.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,
                   (200...299).contains(httpResponse.statusCode) else {
                 currentStatus = .notConfigured
@@ -69,53 +87,7 @@ public actor OllamaService: AIEngineProtocol {
         }
     }
 
-    public func send(message: String) async throws -> AsyncThrowingStream<String, Error> {
-        if case .ready = currentStatus {
-            // no-op
-        } else {
-            await checkConnection()
-            guard case .ready = currentStatus else {
-                throw OllamaServiceError.serviceUnavailable
-            }
-        }
-
-        let request = try Self.buildChatRequest(
-            endpoint: endpoint,
-            model: model,
-            history: activeHistory,
-            systemPrompt: effectiveSystemPrompt,
-            userMessage: message
-        )
-        let userMessage = ChatMessage(role: .user, content: message)
-
-        return AsyncThrowingStream<String, Error> { continuation in
-            Task {
-                do {
-                    let stream = try await URLSession.shared.bytes(for: request)
-                    let assistantMessage = try await self.consumeStream(
-                        bytes: stream.0,
-                        response: stream.1,
-                        continuation: continuation,
-                        onToolCall: nil
-                    )
-
-                    self.recordConversation(
-                        userMessage: userMessage,
-                        assistantMessage: assistantMessage
-                    )
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-        }
-    }
-
-    public func sendWithTools(
-        message: String,
-        tools: [OllamaTool],
-        onToolCall: @escaping @Sendable (PetToolCall) async -> Void
-    ) async throws -> AsyncThrowingStream<String, Error> {
+    public func send(message: String) async throws -> (streamID: UUID, stream: AsyncThrowingStream<String, Error>) {
         if case .ready = currentStatus {
             // no-op
         } else {
@@ -131,21 +103,23 @@ public actor OllamaService: AIEngineProtocol {
             history: activeHistory,
             systemPrompt: effectiveSystemPrompt,
             userMessage: message,
-            tools: tools
+            options: chatOptions
         )
         let userMessage = ChatMessage(role: .user, content: message)
+        let streamID = UUID()
+        let session = urlSession
 
-        return AsyncThrowingStream<String, Error> { continuation in
-            Task {
+        let stream = AsyncThrowingStream<String, Error> { continuation in
+            let task = Task {
+                defer { Task { await self.removeActiveStream(streamID) } }
                 do {
-                    let stream = try await URLSession.shared.bytes(for: request)
+                    let bytes = try await session.bytes(for: request)
                     let assistantMessage = try await self.consumeStream(
-                        bytes: stream.0,
-                        response: stream.1,
+                        bytes: bytes.0,
+                        response: bytes.1,
                         continuation: continuation,
-                        onToolCall: onToolCall
+                        onToolCall: nil
                     )
-
                     self.recordConversation(
                         userMessage: userMessage,
                         assistantMessage: assistantMessage
@@ -155,8 +129,93 @@ public actor OllamaService: AIEngineProtocol {
                     continuation.finish(throwing: error)
                 }
             }
+            // Register the task so it can be cancelled externally.
+            // We use a detached task to hop back to the actor without blocking the stream setup.
+            Task { await self.registerActiveStream(streamID, task: task) }
         }
+
+        return (streamID: streamID, stream: stream)
     }
+
+    public func sendWithTools(
+        message: String,
+        tools: [OllamaTool],
+        onToolCall: @escaping @Sendable (PetToolCall) async -> Void
+    ) async throws -> (streamID: UUID, stream: AsyncThrowingStream<String, Error>) {
+        if case .ready = currentStatus {
+            // no-op
+        } else {
+            await checkConnection()
+            guard case .ready = currentStatus else {
+                throw OllamaServiceError.serviceUnavailable
+            }
+        }
+
+        let request = try Self.buildChatRequest(
+            endpoint: endpoint,
+            model: model,
+            history: activeHistory,
+            systemPrompt: effectiveSystemPrompt,
+            userMessage: message,
+            tools: tools,
+            options: chatOptions
+        )
+        let userMessage = ChatMessage(role: .user, content: message)
+        let streamID = UUID()
+        let session = urlSession
+
+        let stream = AsyncThrowingStream<String, Error> { continuation in
+            let task = Task {
+                defer { Task { await self.removeActiveStream(streamID) } }
+                do {
+                    let bytes = try await session.bytes(for: request)
+                    let assistantMessage = try await self.consumeStream(
+                        bytes: bytes.0,
+                        response: bytes.1,
+                        continuation: continuation,
+                        onToolCall: onToolCall
+                    )
+                    self.recordConversation(
+                        userMessage: userMessage,
+                        assistantMessage: assistantMessage
+                    )
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            Task { await self.registerActiveStream(streamID, task: task) }
+        }
+
+        return (streamID: streamID, stream: stream)
+    }
+
+    // MARK: - Stream cancellation
+
+    /// Cancel a specific stream by its ID. The downstream `for try await` loop will receive `CancellationError`.
+    public func cancel(streamID: UUID) {
+        activeStreams[streamID]?.cancel()
+        activeStreams[streamID] = nil
+    }
+
+    /// Cancel all active streams (e.g. on session switch or app quit).
+    public func cancelAll() {
+        for task in activeStreams.values {
+            task.cancel()
+        }
+        activeStreams.removeAll()
+    }
+
+    // Internal helpers — called from inside Task closures that cannot directly mutate actor state.
+    private func registerActiveStream(_ id: UUID, task: Task<Void, Never>) {
+        activeStreams[id] = task
+    }
+
+    private func removeActiveStream(_ id: UUID) {
+        activeStreams[id] = nil
+    }
+
+    // MARK: - History
 
     public func clearHistory() {
         sessionHistories[currentSessionId]?.removeAll()
@@ -222,6 +281,10 @@ public actor OllamaService: AIEngineProtocol {
         currentStatus = .notConfigured
     }
 
+    public func setChatOptions(temperature: Double, topP: Double, numCtx: Int) {
+        chatOptions = ChatOptions(temperature: temperature, topP: topP, numCtx: numCtx)
+    }
+
     public func updateSystemPrompt(_ prompt: String) {
         customSystemPrompt = prompt
     }
@@ -253,7 +316,7 @@ public actor OllamaService: AIEngineProtocol {
             stream: false
         )
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await urlSession.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             throw OllamaServiceError.invalidResponse
@@ -286,7 +349,7 @@ public actor OllamaService: AIEngineProtocol {
             stream: false
         )
 
-        let (responseData, response) = try await URLSession.shared.data(for: request)
+        let (responseData, response) = try await urlSession.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             return []
@@ -307,7 +370,8 @@ public actor OllamaService: AIEngineProtocol {
         systemPrompt: String,
         userMessage: String,
         tools: [OllamaTool]? = nil,
-        stream: Bool = true
+        stream: Bool = true,
+        options: ChatOptions? = nil
     ) throws -> URLRequest {
         let payload = ChatPayload(
             model: model,
@@ -317,7 +381,8 @@ public actor OllamaService: AIEngineProtocol {
                 systemPrompt: systemPrompt
             ),
             stream: stream,
-            tools: tools
+            tools: tools,
+            options: options
         )
 
         var request = URLRequest(url: endpoint.appendingPathComponent("api").appendingPathComponent("chat"))
@@ -357,6 +422,14 @@ public actor OllamaService: AIEngineProtocol {
 
     internal func configSnapshot() -> (endpoint: URL, model: String) {
         (endpoint, model)
+    }
+
+    internal func forceReadyStatusForTesting() {
+        currentStatus = .ready
+    }
+
+    internal func isStreamRegistered(_ id: UUID) -> Bool {
+        activeStreams[id] != nil
     }
 
     private func consumeStream(
@@ -485,11 +558,24 @@ public actor OllamaService: AIEngineProtocol {
         return array
     }
 
+    struct ChatOptions: Codable {
+        let temperature: Double
+        let topP: Double
+        let numCtx: Int
+
+        enum CodingKeys: String, CodingKey {
+            case temperature
+            case topP = "top_p"
+            case numCtx = "num_ctx"
+        }
+    }
+
     private struct ChatPayload: Codable {
         let model: String
         let messages: [PayloadMessage]
         let stream: Bool
         let tools: [OllamaTool]?
+        let options: ChatOptions?
     }
 
     internal struct PayloadMessage: Codable {

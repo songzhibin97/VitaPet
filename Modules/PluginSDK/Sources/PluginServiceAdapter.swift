@@ -2,6 +2,10 @@ import Foundation
 import PluginProtocols
 
 /// 将 VitaPluginServiceProtocol 的 @objc 调用桥接到 VitaPlugin
+// @unchecked Sendable is required because NSObject does not conform to Sendable in
+// Swift 6, and VitaPluginServiceProtocol is an @objc protocol (ObjC bridge).
+// This adapter is created per-connection inside NSXPCListenerDelegate and accessed
+// only through XPC infrastructure, so concurrent access to its state cannot occur.
 final class PluginServiceAdapter: NSObject, VitaPluginServiceProtocol, @unchecked Sendable {
     private let plugin: any VitaPlugin
     private weak var hostProxy: VitaPluginHostProtocol?

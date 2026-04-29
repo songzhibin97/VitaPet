@@ -99,6 +99,7 @@ public enum L10n {
     public static var chatSelectPets: String { tr("chat.select_pets") }
     public static var chatStreamingPlaceholder: String { tr("chat.streaming_placeholder") }
     public static var chatSend: String { tr("chat.send") }
+    public static var chatStopGeneration: String { tr("chat.stop_generation") }
     public static var chatEmptyNotConfigured: String { tr("chat.empty.not_configured") }
     public static var chatEmptyNewConversation: String { tr("chat.empty.new_conversation") }
     public static var chatAssistantNotConfigured: String { tr("chat.assistant.not_configured") }
@@ -171,6 +172,9 @@ public enum L10n {
     private static let storage = Storage()
 }
 
+// Storage uses NSLock to protect all mutable state (currentLocale, cachedTables),
+// making it safe for concurrent access. @unchecked Sendable is required because
+// NSLock itself is not Sendable, even though usage here is data-race-free.
 private final class Storage: @unchecked Sendable {
     private let lock = NSLock()
     private var currentLocale = "zh-Hans"

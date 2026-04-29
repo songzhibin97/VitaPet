@@ -103,6 +103,7 @@
   "chat.select_pets": "选择聊天对象",
   "chat.streaming_placeholder": "AI 正在回复...",
   "chat.send": "发送",
+  "chat.stop_generation": "停止",
   "chat.empty.not_configured": "AI 尚未配置，完成配置后即可开始对话。",
   "chat.empty.new_conversation": "开始一段新的对话。",
   "chat.assistant.not_configured": "AI 尚未配置",

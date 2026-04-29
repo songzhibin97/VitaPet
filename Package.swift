@@ -2,7 +2,7 @@
 import PackageDescription
 
 let strictConcurrency: [SwiftSetting] = [
-    .unsafeFlags(["-strict-concurrency=complete"]),
+    .swiftLanguageMode(.v6),
     .define("DEBUG", .when(configuration: .debug)),
 ]
 
@@ -79,7 +79,7 @@ let package = Package(
         ),
         .target(
             name: "ChatUI",
-            dependencies: ["AIEngine", "Localization", "RenderEngine", "EventBus"],
+            dependencies: ["AIEngine", "Localization", "RenderEngine", "EventBus", "Persistence"],
             path: "Modules/ChatUI/Sources",
             swiftSettings: strictConcurrency
         ),
@@ -90,7 +90,7 @@ let package = Package(
         ),
         .target(
             name: "Persistence",
-            dependencies: ["ChatUI"],
+            dependencies: ["SecurityLayer"],
             path: "Modules/Persistence/Sources",
             swiftSettings: strictConcurrency
         ),
@@ -122,8 +122,8 @@ let package = Package(
         .testTarget(name: "SecurityLayerTests", dependencies: ["SecurityLayer"], path: "Modules/SecurityLayer/Tests", swiftSettings: strictConcurrency),
         .testTarget(name: "FocusMonitorTests", dependencies: ["FocusMonitor", "EventBus"], path: "Modules/FocusMonitor/Tests", swiftSettings: strictConcurrency),
         .testTarget(name: "LocalizationTests", dependencies: ["Localization"], path: "Modules/Localization/Tests", swiftSettings: strictConcurrency),
-        .testTarget(name: "PersistenceTests", dependencies: ["Persistence", "ChatUI"], path: "Modules/Persistence/Tests", swiftSettings: strictConcurrency),
+        .testTarget(name: "PersistenceTests", dependencies: ["Persistence", "SecurityLayer"], path: "Modules/Persistence/Tests", swiftSettings: strictConcurrency),
         .testTarget(name: "AIEngineTests", dependencies: ["AIEngine"], path: "Modules/AIEngine/Tests", swiftSettings: strictConcurrency),
-        .testTarget(name: "ChatUITests", dependencies: ["ChatUI", "AIEngine"], path: "Modules/ChatUI/Tests", swiftSettings: strictConcurrency)
+        .testTarget(name: "ChatUITests", dependencies: ["ChatUI", "AIEngine", "Persistence"], path: "Modules/ChatUI/Tests", swiftSettings: strictConcurrency)
     ]
 )

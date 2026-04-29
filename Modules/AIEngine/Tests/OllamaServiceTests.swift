@@ -2,6 +2,8 @@
 import Foundation
 import XCTest
 
+// MARK: - Mock URLProtocol (synchronous response)
+
 private final class OllamaServiceURLProtocol: URLProtocol, @unchecked Sendable {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
@@ -42,16 +44,49 @@ private final class OllamaServiceURLProtocol: URLProtocol, @unchecked Sendable {
         lock.lock()
         requestHandler = handler
         lock.unlock()
-        URLProtocol.registerClass(Self.self)
     }
 
     static func uninstall() {
         lock.lock()
         requestHandler = nil
         lock.unlock()
-        URLProtocol.unregisterClass(Self.self)
     }
 }
+
+// MARK: - Hanging URLProtocol (never responds — used for cancel/timeout tests)
+
+private final class HangingURLProtocol: URLProtocol, @unchecked Sendable {
+    // stopLoading is called when the task is cancelled; we signal that via this nonisolated-unsafe flag.
+    nonisolated(unsafe) static var didStop = false
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        // Intentionally do nothing — the request hangs forever until cancelled.
+    }
+
+    override func stopLoading() {
+        Self.didStop = true
+        client?.urlProtocol(self, didFailWithError: URLError(.cancelled))
+    }
+}
+
+// MARK: - Test helpers
+
+private func makeMockSession() -> URLSession {
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [OllamaServiceURLProtocol.self]
+    return URLSession(configuration: config)
+}
+
+private func makeHangingSession() -> URLSession {
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [HangingURLProtocol.self]
+    return URLSession(configuration: config)
+}
+
+// MARK: - Helpers
 
 private actor ConversationUpdateRecorder {
     private var updates: [(role: String, content: String, sessionId: String, petId: String?, petName: String?)] = []
@@ -98,9 +133,12 @@ private extension URLRequest {
     }
 }
 
+// MARK: - Tests
+
 final class OllamaServiceTests: XCTestCase {
     override func tearDown() {
         OllamaServiceURLProtocol.uninstall()
+        HangingURLProtocol.didStop = false
         super.tearDown()
     }
 
@@ -301,9 +339,11 @@ final class OllamaServiceTests: XCTestCase {
     }
 
     func testUpdateMemories_includesMemoriesInChatRequest() async throws {
+        let session = makeMockSession()
         let service = OllamaService(
             endpoint: URL(string: "http://unit.test")!,
-            model: "llama3.2"
+            model: "llama3.2",
+            urlSession: session
         )
         let chatRequestObserved = expectation(description: "chat request observed")
         chatRequestObserved.assertForOverFulfill = true
@@ -341,16 +381,18 @@ final class OllamaServiceTests: XCTestCase {
         }
 
         await service.updateMemories(["用户喜欢冻干", "用户叫小宋"])
-        let stream = try await service.send(message: "记住我了吗")
+        let (_, stream) = try await service.send(message: "记住我了吗")
         for try await _ in stream {}
 
         await fulfillment(of: [chatRequestObserved], timeout: 1.0)
     }
 
     func testSetOnConversationUpdated_recordsCallbackWhenConversationIsRecorded() async throws {
+        let session = makeMockSession()
         let service = OllamaService(
             endpoint: URL(string: "http://unit.test")!,
-            model: "llama3.2"
+            model: "llama3.2",
+            urlSession: session
         )
         let recorder = ConversationUpdateRecorder()
         let callbackReceived = expectation(description: "conversation update callback fired twice")
@@ -382,7 +424,7 @@ final class OllamaServiceTests: XCTestCase {
             callbackReceived.fulfill()
         }
 
-        let stream = try await service.send(message: "你好")
+        let (_, stream) = try await service.send(message: "你好")
         for try await _ in stream {}
 
         await fulfillment(of: [callbackReceived], timeout: 1.0)
@@ -413,5 +455,148 @@ final class OllamaServiceTests: XCTestCase {
         let config = await service.configSnapshot()
         XCTAssertEqual(config.endpoint, newEndpoint)
         XCTAssertEqual(config.model, "qwen2.5")
+    }
+
+    // MARK: - New cancel / timeout tests
+
+    /// send() returns a streamID; the activeStreams dictionary should contain it while streaming.
+    func testSendReturnsStreamID_activeStreamIsRegistered() async throws {
+        // Use a hanging session so the stream stays open long enough to inspect.
+        let session = makeHangingSession()
+        let service = OllamaService(
+            endpoint: URL(string: "http://unit.test")!,
+            model: "llama3.2",
+            urlSession: session
+        )
+        // Force status to ready so send() doesn't call checkConnection (which would also hang).
+        await service.forceReadyStatusForTesting()
+
+        let streamID = try await { () async throws -> UUID in
+            let (id, _) = try await service.send(message: "hello")
+            return id
+        }()
+
+        // Give the internal Task a moment to register itself.
+        try await Task.sleep(nanoseconds: 50_000_000) // 50ms
+        let isRegistered = await service.isStreamRegistered(streamID)
+        XCTAssertTrue(isRegistered, "Active stream should be registered with the returned streamID")
+
+        // Cleanup
+        await service.cancel(streamID: streamID)
+    }
+
+    /// cancel(streamID:) causes the downstream async-for loop to throw CancellationError or finish.
+    func testCancelStopsStream() async throws {
+        let session = makeHangingSession()
+        let service = OllamaService(
+            endpoint: URL(string: "http://unit.test")!,
+            model: "llama3.2",
+            urlSession: session
+        )
+        await service.forceReadyStatusForTesting()
+
+        let (streamID, stream) = try await service.send(message: "hello")
+        // Give the internal Task time to register.
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Cancel in the background while iterating.
+        Task {
+            try? await Task.sleep(nanoseconds: 20_000_000) // 20ms
+            await service.cancel(streamID: streamID)
+        }
+
+        var didTerminate = false
+        do {
+            for try await _ in stream {
+                // no chunks expected from a hanging protocol
+            }
+            didTerminate = true
+        } catch {
+            // CancellationError or URLError.cancelled — both are acceptable.
+            didTerminate = true
+        }
+
+        XCTAssertTrue(didTerminate, "Stream should terminate after cancel(streamID:) is called")
+        let isStillRegistered = await service.isStreamRegistered(streamID)
+        XCTAssertFalse(isStillRegistered, "Cancelled stream should be removed from activeStreams")
+    }
+
+    /// cancelAll() terminates all active streams simultaneously.
+    func testCancelAll_terminatesBothStreams() async throws {
+        let session = makeHangingSession()
+        let service = OllamaService(
+            endpoint: URL(string: "http://unit.test")!,
+            model: "llama3.2",
+            urlSession: session
+        )
+        await service.forceReadyStatusForTesting()
+
+        let (id1, stream1) = try await service.send(message: "msg1")
+        let (id2, stream2) = try await service.send(message: "msg2")
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let reg1Before = await service.isStreamRegistered(id1)
+        let reg2Before = await service.isStreamRegistered(id2)
+        XCTAssertTrue(reg1Before)
+        XCTAssertTrue(reg2Before)
+
+        await service.cancelAll()
+
+        // Both streams should terminate.
+        let terminated1 = await drainStream(stream1)
+        let terminated2 = await drainStream(stream2)
+        XCTAssertTrue(terminated1, "Stream 1 should terminate after cancelAll()")
+        XCTAssertTrue(terminated2, "Stream 2 should terminate after cancelAll()")
+
+        let reg1After = await service.isStreamRegistered(id1)
+        let reg2After = await service.isStreamRegistered(id2)
+        XCTAssertFalse(reg1After)
+        XCTAssertFalse(reg2After)
+    }
+
+    /// When the URLSession times out, the stream propagates the error to consumers.
+    func testTimeoutError_propagatesToStream() async throws {
+        // Use a very short request timeout so the test finishes quickly.
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [HangingURLProtocol.self]
+        config.timeoutIntervalForRequest = 0.1 // 100ms
+        let shortTimeoutSession = URLSession(configuration: config)
+
+        let service = OllamaService(
+            endpoint: URL(string: "http://unit.test")!,
+            model: "llama3.2",
+            urlSession: shortTimeoutSession
+        )
+        await service.forceReadyStatusForTesting()
+
+        let (_, stream) = try await service.send(message: "timeout test")
+
+        var caughtError: Error?
+        do {
+            for try await _ in stream {}
+        } catch {
+            caughtError = error
+        }
+
+        XCTAssertNotNil(caughtError, "Stream should throw an error on timeout")
+        // URLError.timedOut or URLError.cancelled both indicate the stream ended due to timeout/cancel.
+        if let urlError = caughtError as? URLError {
+            XCTAssertTrue(
+                urlError.code == .timedOut || urlError.code == .cancelled,
+                "Expected timedOut or cancelled, got \(urlError.code)"
+            )
+        }
+        // If it's another error type, we just verify it's non-nil — timeout manifested.
+    }
+}
+
+// MARK: - Test-only drain helper
+
+private func drainStream(_ stream: AsyncThrowingStream<String, Error>) async -> Bool {
+    do {
+        for try await _ in stream {}
+        return true
+    } catch {
+        return true // terminated via error — still counts as terminated
     }
 }
