@@ -20,10 +20,13 @@ final class PluginManagerTests: XCTestCase {
         let tempDir = tempDir!
         return await MainActor.run {
             let configManager = ConfigManager(storageURL: tempDir)
+            // Use tempDir as the dev whitelist so unsigned test fixtures (all under tempDir)
+            // are still loaded without signature verification.
+            let loader = PluginLoader(developerMode: true, developerWhitelistDirectory: tempDir)
             if let pluginDirectories {
-                return PluginManager(loader: PluginLoader(developerMode: true), configManager: configManager, pluginDirectories: pluginDirectories)
+                return PluginManager(loader: loader, configManager: configManager, pluginDirectories: pluginDirectories)
             }
-            return PluginManager(loader: PluginLoader(developerMode: true), configManager: configManager)
+            return PluginManager(loader: loader, configManager: configManager)
         }
     }
 

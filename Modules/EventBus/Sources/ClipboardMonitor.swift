@@ -8,7 +8,7 @@ protocol ClipboardPasteboard: AnyObject {
 }
 
 @MainActor
-final class ClipboardReader: @unchecked Sendable {
+final class ClipboardReader: Sendable {
     private let readChangeCount: @MainActor () -> Int
     private let readStringContent: @MainActor () -> String?
 

@@ -1,5 +1,7 @@
 import AppKit
 import CoreGraphics
+import EventBus
+import SecurityLayer
 
 struct DetectedWindow {
     let frame: CGRect
@@ -19,6 +21,11 @@ struct DetectedWindow {
 
 @MainActor
 final class WindowDetector {
+    /// EventBus to publish permission-missing events (injected from AppDelegate).
+    var eventBus: EventBus?
+    /// Ensures the permission-missing event is only published once per launch.
+    private var permissionEventPublished = false
+
     /// 检测当前屏幕上可见的窗口
     /// excludingWindowNumbers: 要排除的窗口号（VitaPet 自己的窗口）
     func detectWindows(excludingWindowNumbers: Set<Int> = []) -> [DetectedWindow] {
@@ -28,6 +35,15 @@ final class WindowDetector {
                 kCGNullWindowID
             ) as? [[String: Any]]
         else {
+            // Publish permission-missing event once if screen recording is not granted.
+            if !permissionEventPublished,
+               !PermissionGate.checkPermission(.screenRecording),
+               let bus = eventBus {
+                permissionEventPublished = true
+                Task {
+                    await bus.publish(.custom(name: "permissionMissing", payload: ["capability": "screenRecording"]))
+                }
+            }
             return []
         }
 

@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 
 @MainActor
-public final class KeyboardMonitor: EventSource, @unchecked Sendable {
+public final class KeyboardMonitor: EventSource, Sendable {
     public let sourceId: String = "keyboard"
 
     private let addGlobalMonitor: (@escaping (NSEvent) -> Void) -> Any?

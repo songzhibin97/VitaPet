@@ -105,6 +105,7 @@
   "chat.select_pets": "Select pets to chat with",
   "chat.streaming_placeholder": "AI is replying...",
   "chat.send": "Send",
+  "chat.stop_generation": "Stop",
   "chat.empty.not_configured": "AI is not configured yet. Complete setup to start chatting.",
   "chat.empty.new_conversation": "Start a new conversation.",
   "chat.assistant.not_configured": "AI is not configured",

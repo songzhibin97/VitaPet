@@ -3,6 +3,10 @@ import PluginProtocols
 
 /// 预留给未来原生 XPC 插件支持；当前宿主暂未接入原生插件事件路由。
 /// 插件开发者在 main.swift 调用: PluginEntryPoint(plugin: MyPlugin()).run()
+// @unchecked Sendable is required because NSObject does not conform to Sendable in
+// Swift 6. NSXPCListener is also an ObjC type without Sendable conformance.
+// This class is only ever created and used on the XPC service main thread (via run()),
+// so there is no concurrent access to its state.
 public final class PluginEntryPoint: NSObject, @unchecked Sendable {
     private let plugin: any VitaPlugin
     private let listener: NSXPCListener

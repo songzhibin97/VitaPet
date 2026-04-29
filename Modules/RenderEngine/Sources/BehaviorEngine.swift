@@ -20,6 +20,9 @@ public final class BehaviorEngine {
         case bottom
     }
 
+    // @unchecked Sendable is required because Timer callbacks are not actor-isolated.
+    // All mutations of CursorTrackingContext go through MainActor.assumeIsolated()
+    // inside the Timer block, so access is always serialised on the main thread.
     private final class CursorTrackingContext: @unchecked Sendable {
         var lastReactTime: Date
         var cursorWasOutsideReactZone: Bool
@@ -30,6 +33,9 @@ public final class BehaviorEngine {
         }
     }
 
+    // @unchecked Sendable is required because Timer callbacks are not actor-isolated.
+    // All mutations of MovementState go through MainActor.assumeIsolated() inside
+    // the Timer block, so access is always serialised on the main thread.
     private final class MovementState: @unchecked Sendable {
         let id: UUID
         var timer: Timer?
@@ -328,6 +334,9 @@ public final class BehaviorEngine {
         let movementID = UUID()
         currentMovement = MovementState(id: movementID, completion: onComplete)
 
+        // @unchecked Sendable is required to capture this mutable reference type in a Timer
+        // callback. All access occurs inside MainActor.assumeIsolated() blocks, so it is
+        // data-race-free.
         final class TrackingState: @unchecked Sendable { var position: NSPoint; init(_ p: NSPoint) { position = p } }
         let tracking = TrackingState(currentPosition)
         let startTime = Date()

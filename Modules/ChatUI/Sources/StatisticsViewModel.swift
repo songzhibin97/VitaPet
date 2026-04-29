@@ -50,17 +50,20 @@ public final class StatisticsViewModel {
     public private(set) var dailyInteractions: [DailyInteraction] = []
     public private(set) var isLoading = false
     public var selectedDays: Int = 7
+    public private(set) var isPersistenceAvailable: Bool
 
     private var loadMoodHistory: @Sendable (String?, Int) async throws -> [(timestamp: Date, happiness: Int, petName: String)]
     private var loadBehaviorCounts: @Sendable (Int) async throws -> [(state: String, count: Int, petName: String)]
     private var loadDailyInteractions: @Sendable (Int) async throws -> [(date: String, clicks: Int, interactions: Int, games: Int)]
 
     public init(
+        isPersistenceAvailable: Bool = true,
         selectedDays: Int = 7,
         loadMoodHistory: @escaping @Sendable (String?, Int) async throws -> [(timestamp: Date, happiness: Int, petName: String)] = { _, _ in [] },
         loadBehaviorCounts: @escaping @Sendable (Int) async throws -> [(state: String, count: Int, petName: String)] = { _ in [] },
         loadDailyInteractions: @escaping @Sendable (Int) async throws -> [(date: String, clicks: Int, interactions: Int, games: Int)] = { _ in [] }
     ) {
+        self.isPersistenceAvailable = isPersistenceAvailable
         self.selectedDays = selectedDays
         self.loadMoodHistory = loadMoodHistory
         self.loadBehaviorCounts = loadBehaviorCounts

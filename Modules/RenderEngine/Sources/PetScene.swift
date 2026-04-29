@@ -8,6 +8,9 @@ public enum HorizontalDirection: Sendable {
 }
 
 @MainActor
+// @unchecked Sendable is required because SKScene (ObjC class) does not conform
+// to Sendable in Swift 6. All mutable state is @MainActor-isolated, so concurrent
+// access cannot occur.
 public final class PetScene: SKScene, @unchecked Sendable {
     public let petNode: SKSpriteNode
 

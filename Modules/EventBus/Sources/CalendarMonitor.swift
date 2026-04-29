@@ -2,7 +2,7 @@
 import Foundation
 
 @MainActor
-public final class CalendarMonitor: EventSource, @unchecked Sendable {
+public final class CalendarMonitor: EventSource, Sendable {
     public nonisolated let sourceId = "calendarMonitor"
 
     private var eventBus: EventBus?
@@ -10,6 +10,7 @@ public final class CalendarMonitor: EventSource, @unchecked Sendable {
     private var checkTimer: Timer?
     private let eventStore = EKEventStore()
     private let requestAccessHandler: @MainActor @Sendable (EKEventStore) async throws -> Bool
+    private let eventsProvider: @MainActor @Sendable (Date, Date) -> [EKEvent]
     private var remindedEventIDs: Set<String> = []
     private let lookAheadMinutes: Int
     private let checkIntervalSeconds: TimeInterval
@@ -19,6 +20,11 @@ public final class CalendarMonitor: EventSource, @unchecked Sendable {
         checkIntervalSeconds: TimeInterval = 300
     ) {
         self.requestAccessHandler = Self.defaultRequestAccess
+        let store = EKEventStore()
+        self.eventsProvider = { start, end in
+            let predicate = store.predicateForEvents(withStart: start, end: end, calendars: nil)
+            return store.events(matching: predicate)
+        }
         self.lookAheadMinutes = lookAheadMinutes
         self.checkIntervalSeconds = checkIntervalSeconds
     }
@@ -26,9 +32,19 @@ public final class CalendarMonitor: EventSource, @unchecked Sendable {
     init(
         lookAheadMinutes: Int = 15,
         checkIntervalSeconds: TimeInterval = 300,
-        requestAccessHandler: @escaping @MainActor @Sendable (EKEventStore) async throws -> Bool
+        requestAccessHandler: @escaping @MainActor @Sendable (EKEventStore) async throws -> Bool,
+        eventsProvider: (@MainActor @Sendable (Date, Date) -> [EKEvent])? = nil
     ) {
         self.requestAccessHandler = requestAccessHandler
+        if let eventsProvider {
+            self.eventsProvider = eventsProvider
+        } else {
+            let store = EKEventStore()
+            self.eventsProvider = { start, end in
+                let predicate = store.predicateForEvents(withStart: start, end: end, calendars: nil)
+                return store.events(matching: predicate)
+            }
+        }
         self.lookAheadMinutes = lookAheadMinutes
         self.checkIntervalSeconds = checkIntervalSeconds
     }
@@ -72,6 +88,11 @@ public final class CalendarMonitor: EventSource, @unchecked Sendable {
         eventBus = nil
     }
 
+    /// Triggers an immediate check cycle. Package-internal; used by tests.
+    func triggerCheck() async {
+        await checkUpcomingEvents()
+    }
+
     private func requestCalendarAccess() async throws -> Bool {
         try await requestAccessHandler(eventStore)
     }
@@ -101,12 +122,7 @@ public final class CalendarMonitor: EventSource, @unchecked Sendable {
 
         let now = Date()
         let endDate = now.addingTimeInterval(TimeInterval(lookAheadMinutes * 60))
-        let predicate = eventStore.predicateForEvents(
-            withStart: now,
-            end: endDate,
-            calendars: nil
-        )
-        let events = eventStore.events(matching: predicate)
+        let events = eventsProvider(now, endDate)
 
         for event in events {
             let eventID = identifier(for: event)
@@ -131,13 +147,7 @@ public final class CalendarMonitor: EventSource, @unchecked Sendable {
         }
 
         let oneHourAgo = now.addingTimeInterval(-3600)
-        let activeEvents = eventStore.events(
-            matching: eventStore.predicateForEvents(
-                withStart: oneHourAgo,
-                end: now.addingTimeInterval(86400),
-                calendars: nil
-            )
-        )
+        let activeEvents = eventsProvider(oneHourAgo, now.addingTimeInterval(86400))
         let activeIDs = Set(activeEvents.map(identifier(for:)))
         remindedEventIDs = remindedEventIDs.intersection(activeIDs)
     }

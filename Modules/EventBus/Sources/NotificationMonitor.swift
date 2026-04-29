@@ -1,7 +1,7 @@
 import Foundation
 
 @MainActor
-public final class NotificationMonitor: EventSource, @unchecked Sendable {
+public final class NotificationMonitor: EventSource, Sendable {
     public let sourceId = "notificationMonitor"
 
     private let notificationCenter: DistributedNotificationCenter

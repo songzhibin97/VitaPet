@@ -1,6 +1,7 @@
 import AppKit
 import EventBus
 import Localization
+import Persistence
 import SwiftUI
 
 @MainActor
@@ -27,6 +28,13 @@ public final class ChatWindowController: NSWindowController {
     private var aiSystemPrompt: @MainActor () -> String = { "" }
     private var onTestConnection: @MainActor () -> Void = {}
     private var onSaveAIConfig: @MainActor (String, String, String) -> Void = { _, _, _ in }
+    private var aiProactiveEnabled: @MainActor () -> Bool = { true }
+    private var aiProactiveInterval: @MainActor () -> Int = { 45 }
+    private var onSaveAIProactiveConfig: @MainActor (Bool, Int) -> Void = { _, _ in }
+    private var aiTemperature: @MainActor () -> Double = { 0.7 }
+    private var aiTopP: @MainActor () -> Double = { 0.9 }
+    private var aiNumCtx: @MainActor () -> Int = { 4096 }
+    private var onSaveAIChatOptions: @MainActor (Double, Double, Int) -> Void = { _, _, _ in }
     private var githubToken: @MainActor () -> String = { "" }
     private var webhookEnabled: @MainActor () -> Bool = { false }
     private var webhookPort: @MainActor () -> Int = { 19280 }
@@ -144,6 +152,11 @@ public final class ChatWindowController: NSWindowController {
                 ollamaEndpoint: aiEndpoint(),
                 ollamaModel: aiModel(),
                 aiSystemPrompt: aiSystemPrompt(),
+                aiProactiveEnabled: aiProactiveEnabled(),
+                aiProactiveInterval: aiProactiveInterval(),
+                aiTemperature: aiTemperature(),
+                aiTopP: aiTopP(),
+                aiNumCtx: aiNumCtx(),
                 githubToken: githubToken(),
                 webhookEnabled: webhookEnabled(),
                 webhookPort: webhookPort(),
@@ -151,6 +164,8 @@ public final class ChatWindowController: NSWindowController {
                 aiStatus: aiStatus(),
                 onTestConnection: onTestConnection,
                 onSaveAIConfig: onSaveAIConfig,
+                onSaveAIProactiveConfig: onSaveAIProactiveConfig,
+                onSaveAIChatOptions: onSaveAIChatOptions,
                 onSaveNotificationConfig: onSaveNotificationConfig,
                 onUpdatePet: onUpdatePet,
                 onUpdatePetSound: onUpdatePetSound,
@@ -277,7 +292,14 @@ public final class ChatWindowController: NSWindowController {
         aiSystemPrompt: @escaping @MainActor () -> String,
         aiStatus: @escaping @MainActor () -> AIEngineStatus,
         onTestConnection: @escaping @MainActor () -> Void = {},
-        onSaveAIConfig: @escaping @MainActor (String, String, String) -> Void = { _, _, _ in }
+        onSaveAIConfig: @escaping @MainActor (String, String, String) -> Void = { _, _, _ in },
+        aiProactiveEnabled: @escaping @MainActor () -> Bool = { true },
+        aiProactiveInterval: @escaping @MainActor () -> Int = { 45 },
+        onSaveAIProactiveConfig: @escaping @MainActor (Bool, Int) -> Void = { _, _ in },
+        aiTemperature: @escaping @MainActor () -> Double = { 0.7 },
+        aiTopP: @escaping @MainActor () -> Double = { 0.9 },
+        aiNumCtx: @escaping @MainActor () -> Int = { 4096 },
+        onSaveAIChatOptions: @escaping @MainActor (Double, Double, Int) -> Void = { _, _, _ in }
     ) {
         self.aiEndpoint = aiEndpoint
         self.aiModel = aiModel
@@ -285,6 +307,13 @@ public final class ChatWindowController: NSWindowController {
         self.aiStatus = aiStatus
         self.onTestConnection = onTestConnection
         self.onSaveAIConfig = onSaveAIConfig
+        self.aiProactiveEnabled = aiProactiveEnabled
+        self.aiProactiveInterval = aiProactiveInterval
+        self.onSaveAIProactiveConfig = onSaveAIProactiveConfig
+        self.aiTemperature = aiTemperature
+        self.aiTopP = aiTopP
+        self.aiNumCtx = aiNumCtx
+        self.onSaveAIChatOptions = onSaveAIChatOptions
     }
 
     public func configureNotificationSettings(

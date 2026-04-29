@@ -4,7 +4,9 @@ import Foundation
 public actor FSEventsMonitor: EventSource {
     public let sourceId: String
 
-    private final class CallbackContext: @unchecked Sendable {
+    // CallbackContext holds only immutable let fields (EventBus actor is Sendable),
+    // so plain Sendable conformance is correct — no @unchecked needed.
+    private final class CallbackContext: Sendable {
         let eventBus: EventBus
 
         init(eventBus: EventBus) {
@@ -17,6 +19,9 @@ public actor FSEventsMonitor: EventSource {
     private let queue: DispatchQueue
     private var streamRef: FSEventStreamRef?
     private var callbackContext: UnsafeMutableRawPointer?
+
+    /// Whether the FSEvents stream is currently active.
+    public var isMonitoring: Bool { streamRef != nil }
 
     private static let callback: FSEventStreamCallback = { _, clientCallBackInfo, numEvents, eventPaths, eventFlags, _ in
         guard let clientCallBackInfo else {

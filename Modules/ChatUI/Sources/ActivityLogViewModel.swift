@@ -39,14 +39,17 @@ public final class ActivityLogViewModel {
     public private(set) var isLoading = false
     public private(set) var errorMessage: String?
     public private(set) var canLoadMore = true
+    public private(set) var isPersistenceAvailable: Bool
 
     private let loadEvents: @Sendable (Int, Int) async throws -> [EventEntry]
     private let pageSize: Int
 
     public init(
+        isPersistenceAvailable: Bool = true,
         pageSize: Int = 50,
         loadEvents: @escaping @Sendable (Int, Int) async throws -> [EventEntry]
     ) {
+        self.isPersistenceAvailable = isPersistenceAvailable
         self.pageSize = pageSize
         self.loadEvents = loadEvents
     }

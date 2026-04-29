@@ -1,5 +1,4 @@
 import Foundation
-import ChatUI
 import SQLite3
 
 public actor DatabaseManager {

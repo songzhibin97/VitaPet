@@ -25,9 +25,40 @@ public struct PluginLoader: Sendable {
     private static let logger = Logger(subsystem: "VitaPet", category: "PluginLoader")
 
     public let developerMode: Bool
+    public let developerWhitelistDirectory: URL?
 
-    public init(developerMode: Bool = false) {
+    public init(developerMode: Bool = false, developerWhitelistDirectory: URL? = nil) {
         self.developerMode = developerMode
+        self.developerWhitelistDirectory = developerWhitelistDirectory
+    }
+
+    /// Returns true only when developerMode is enabled AND pluginURL resolves to a path
+    /// strictly inside developerWhitelistDirectory (symlinks resolved, no prefix boundary issues).
+    private func isInsideDeveloperWhitelist(_ pluginURL: URL) -> Bool {
+        guard developerMode, let whitelistDir = developerWhitelistDirectory else {
+            return false
+        }
+        // Resolve symlinks so an attacker cannot place a symlink inside the whitelist
+        // that points to a plugin outside it.
+        let resolvedPlugin = pluginURL.standardizedFileURL.resolvingSymlinksInPath()
+        let resolvedWhitelist = whitelistDir.standardizedFileURL.resolvingSymlinksInPath()
+
+        // Ensure the whitelist path ends with "/" so "/foo/dev" does NOT match "/foo/devil".
+        var whitelistPath = resolvedWhitelist.path
+        if !whitelistPath.hasSuffix("/") {
+            whitelistPath += "/"
+        }
+
+        var pluginPath = resolvedPlugin.path
+        // Allow an exact match (the plugin IS the whitelist root, unlikely but safe to accept)
+        // or a proper sub-path match.
+        if pluginPath == resolvedWhitelist.path {
+            return true
+        }
+        if !pluginPath.hasSuffix("/") {
+            pluginPath += "/"
+        }
+        return pluginPath.hasPrefix(whitelistPath)
     }
 
     public func discover(in directory: URL) throws -> [PluginBundle] {
@@ -134,10 +165,16 @@ public struct PluginLoader: Sendable {
     }
 
     private func verifySignature(for bundleURL: URL) throws {
+        // Signature verification is skipped only when developerMode is active AND
+        // the plugin lives inside the designated developer whitelist directory.
+        // Plugins outside the whitelist (including the default Plugins directory) always
+        // go through strict validation, even in DEBUG builds.
+        let skipSignature = isInsideDeveloperWhitelist(bundleURL)
+
         var staticCode: SecStaticCode?
         let creationStatus = SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &staticCode)
         guard creationStatus == errSecSuccess else {
-            if developerMode {
+            if skipSignature {
                 Self.logger.warning("Skipping signature creation failure for \(bundleURL.path, privacy: .public): \(creationStatus, privacy: .public)")
                 return
             }
@@ -146,7 +183,7 @@ public struct PluginLoader: Sendable {
         }
 
         guard let staticCode else {
-            if developerMode {
+            if skipSignature {
                 Self.logger.warning("Skipping missing static code reference for \(bundleURL.path, privacy: .public)")
                 return
             }
@@ -156,7 +193,7 @@ public struct PluginLoader: Sendable {
 
         let validationStatus = SecStaticCodeCheckValidity(staticCode, [], nil)
         guard validationStatus == errSecSuccess else {
-            if developerMode {
+            if skipSignature {
                 Self.logger.warning("Skipping signature validation failure for \(bundleURL.path, privacy: .public): \(validationStatus, privacy: .public)")
                 return
             }

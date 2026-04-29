@@ -439,7 +439,7 @@ public struct PluginInfo: Sendable {
     }
 }
 
-struct PluginHandle: @unchecked Sendable {
+struct PluginHandle: Sendable {
     let manifest: PluginManifest
     let bundleURL: URL
     let executableURL: URL?

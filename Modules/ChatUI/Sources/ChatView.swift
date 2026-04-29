@@ -56,11 +56,18 @@ public struct ChatView: View {
                     .lineLimit(1 ... 5)
                     .disabled(sendDisabled)
 
-                Button(L10n.chatSend) {
-                    viewModel.sendMessage()
+                if viewModel.isStreaming {
+                    Button(L10n.chatStopGeneration) {
+                        viewModel.stopGeneration()
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Button(L10n.chatSend) {
+                        viewModel.sendMessage()
+                    }
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .disabled(viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(sendDisabled || viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding(16)
             .background(Color(nsColor: .windowBackgroundColor))

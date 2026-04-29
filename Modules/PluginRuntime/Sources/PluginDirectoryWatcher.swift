@@ -1,6 +1,10 @@
 import CoreServices
 import Foundation
 
+// @unchecked Sendable is required because this class bridges a C FSEvents callback
+// (FSEventStreamCallback) which cannot carry Swift actor isolation. Mutable state
+// (streamRef, callbackContext) is only accessed from the owning actor (PluginManager)
+// which serialises all calls, so there is no data race in practice.
 final class PluginDirectoryWatcher: @unchecked Sendable {
     typealias ChangeHandler = @Sendable (URL) async -> Void
 

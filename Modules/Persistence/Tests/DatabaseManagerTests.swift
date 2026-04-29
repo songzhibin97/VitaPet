@@ -1,7 +1,6 @@
 import Persistence
 import SQLite3
 import XCTest
-import ChatUI
 
 final class DatabaseManagerTests: XCTestCase {
     private var databaseURL: URL!

@@ -65,6 +65,10 @@ public struct StatisticsView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            if !statisticsViewModel.isPersistenceAvailable {
+                PersistenceUnavailableBanner()
+            }
+
             Picker("时间范围", selection: $statisticsViewModel.selectedDays) {
                 Text("最近 7 天").tag(7)
                 Text("最近 30 天").tag(30)
@@ -234,5 +238,22 @@ public struct StatisticsView: View {
             ]
             .filter { $0.count > 0 }
         }
+    }
+}
+
+private struct PersistenceUnavailableBanner: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.white)
+            Text("数据不可用 — 持久化未启用")
+                .font(.subheadline)
+                .foregroundStyle(.white)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.red)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }
