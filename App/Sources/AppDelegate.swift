@@ -46,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var miniGameManager = MiniGameManager()
     private var pomodoroController = PomodoroController()
     private var conversationTurnCount = 0
+    private var chatPathSomersaultFired = false
     private static let memoryExtractionEveryNTurns = 2
     private var memoryRemoteSyncTask: Task<Void, Never>?
     /// 周期性把本地未同步的记忆推到远端，避免单次失败后只能等下次抽取/重启才重传。
@@ -141,27 +142,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         )
         self.chatViewModel = chatViewModel
-        chatViewModel.onUserSent = { [weak self] in
+        chatViewModel.onUserSent = { [weak self, weak chatViewModel] in
             Task { @MainActor in
                 guard let self else {
                     return
                 }
 
+                // 用户输入快路径：识别「翻N个跟头」直接触发，不依赖模型
+                if let lastUser = chatViewModel?.currentMessages.last(where: { $0.role == .user })?.content,
+                   let count = Self.parseSomersaultCount(from: lastUser) {
+                    self.chatPathSomersaultFired = true
+                    for controller in self.petWindowControllers.values {
+                        controller.executeAIAction("somersault", count: count)
+                    }
+                    return  // somersault is its own reaction, skip generic userInteract
+                }
+
+                self.chatPathSomersaultFired = false
                 for controller in self.petWindowControllers.values {
                     await controller.handleAnimationTrigger(.userInteract)
                 }
             }
         }
-        chatViewModel.onAssistantReplied = { [weak self] in
+        chatViewModel.onAssistantReplied = { [weak self, weak chatViewModel] in
             Task { @MainActor in
                 guard let self else {
                     return
                 }
 
-                for controller in self.petWindowControllers.values {
-                    await controller.handleAnimationTrigger(.custom("celebrate"))
+                // 解析最后一条助手消息中的 [ACTION:...] 标签，触发动画并清理可见文本
+                var firedAnyAction = self.chatPathSomersaultFired
+                if let chatViewModel,
+                   let last = chatViewModel.currentMessages.last,
+                   last.role == .assistant {
+                    let (cleanText, actions) = Self.parseActionTags(from: last.content)
+
+                    for action in actions {
+                        if action.name == "somersault" && self.chatPathSomersaultFired {
+                            continue
+                        }
+                        for controller in self.petWindowControllers.values {
+                            controller.executeAIAction(action.name, count: action.count)
+                        }
+                        firedAnyAction = true
+                    }
+
+                    if cleanText != last.content {
+                        chatViewModel.replaceLastAssistantContent(cleanText)
+                    }
                 }
 
+                // 兜底庆祝动画：只在没有任何具体动作被触发时才放，否则会盖掉刚开始的动作（比如翻跟头）
+                if !firedAnyAction {
+                    for controller in self.petWindowControllers.values {
+                        await controller.handleAnimationTrigger(.custom("celebrate"))
+                    }
+                }
+
+                self.chatPathSomersaultFired = false
                 self.conversationTurnCount += 1
                 if self.conversationTurnCount % Self.memoryExtractionEveryNTurns == 0 {
                     Task { await self.runMemoryExtractionCycle() }
@@ -1124,6 +1162,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Update system prompt with current available actions
             Task { await ollamaService.updateAvailableActions(uniqueActions) }
 
+            // 用户输入快路径：识别「翻N个跟头/跟斗/筋斗」直接触发，不依赖模型工具调用
+            let userSomersaultCount = Self.parseSomersaultCount(from: text)
+
             Task { @MainActor in
                 if let selectedConversationId = chatViewModel.selectedConversationId {
                     await ollamaService.switchSession(selectedConversationId)
@@ -1134,7 +1175,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 for (id, controller) in self.petWindowControllers where effectiveTargetPetIDs.contains(id) {
                     await controller.handleAnimationTrigger(.userInteract)
-                    controller.showThinkingBubble()
+                    if let count = userSomersaultCount {
+                        controller.executeAIAction("somersault", count: count)
+                    } else {
+                        controller.showThinkingBubble()
+                    }
                 }
                 chatViewModel.addExternalMessage(text)
             }
@@ -1184,9 +1229,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                             if toolCall.functionName == "pet_action",
                                let action = toolCall.arguments["action"] {
+                                if action == "somersault" && userSomersaultCount != nil {
+                                    return  // 用户输入已经触发过，避免重复翻
+                                }
+                                let count = max(1, min(toolCall.arguments["count"].flatMap(Int.init) ?? 1, 8))
                                 await MainActor.run {
                                     for (id, controller) in self.petWindowControllers where effectiveTargetPetIDs.contains(id) {
-                                        controller.executeAIAction(action)
+                                        controller.executeAIAction(action, count: count)
                                     }
                                 }
                             }
@@ -1209,8 +1258,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             let (cleanText, actions) = Self.parseActionTags(from: fullResponse)
 
                             for action in actions {
+                                if action.name == "somersault" && userSomersaultCount != nil {
+                                    continue
+                                }
                                 for (id, controller) in self.petWindowControllers where effectiveTargetPetIDs.contains(id) {
-                                    controller.executeAIAction(action)
+                                    controller.executeAIAction(action.name, count: action.count)
                                 }
                             }
 
@@ -3038,20 +3090,74 @@ extension AppDelegate {
         return results
     }
 
-    /// Parse [ACTION:xxx] tags from AI response text.
-    /// Returns cleaned text (tags removed) and list of action names.
-    static func parseActionTags(from text: String) -> (cleanText: String, actions: [String]) {
-        var actions: [String] = []
-        let pattern = #"\[ACTION:(\w+)\]"#
+    /// 从用户输入中识别「翻 N 个 跟头/跟斗/筋斗/空翻」或英文 somersault/flip 命令。
+    /// 返回次数（1-8 已 clamp），未匹配返回 nil。
+    static func parseSomersaultCount(from text: String) -> Int? {
+        let zhDigits: [Character: Int] = [
+            "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+            "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10
+        ]
+
+        // 中文模式：可选数字 + 可选「个」 + 跟头/跟斗/筋斗/空翻
+        let zhPattern = #"翻\s*(\d+|[一二三四五六七八九十两])?\s*个?\s*(跟头|跟斗|筋斗|空翻)"#
+        if let regex = try? NSRegularExpression(pattern: zhPattern) {
+            let range = NSRange(text.startIndex..., in: text)
+            if let match = regex.firstMatch(in: text, range: range) {
+                let countRange = match.range(at: 1)
+                if countRange.location == NSNotFound {
+                    return 1
+                }
+                if let r = Range(countRange, in: text) {
+                    let raw = String(text[r])
+                    if let n = Int(raw) {
+                        return max(1, min(n, 8))
+                    }
+                    if let c = raw.first, let n = zhDigits[c] {
+                        return max(1, min(n, 8))
+                    }
+                }
+                return 1
+            }
+        }
+
+        // 英文模式：N somersault(s)/flip(s) 或 do a somersault/flip
+        let enPattern = #"(?i)(?:(\d+)\s*)?(?:somersault|backflip|flip)s?"#
+        if let regex = try? NSRegularExpression(pattern: enPattern) {
+            let range = NSRange(text.startIndex..., in: text)
+            if let match = regex.firstMatch(in: text, range: range) {
+                let countRange = match.range(at: 1)
+                if countRange.location != NSNotFound,
+                   let r = Range(countRange, in: text),
+                   let n = Int(text[r]) {
+                    return max(1, min(n, 8))
+                }
+                return 1
+            }
+        }
+
+        return nil
+    }
+
+    /// Parse [ACTION:xxx] or [ACTION:xxx:N] tags from AI response text.
+    /// Returns cleaned text (tags removed) and list of (action name, count) pairs.
+    static func parseActionTags(from text: String) -> (cleanText: String, actions: [(name: String, count: Int)]) {
+        var actions: [(name: String, count: Int)] = []
+        let pattern = #"\[ACTION:(\w+)(?::(\d+))?\]"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else {
             return (text, [])
         }
         let range = NSRange(text.startIndex..., in: text)
         let matches = regex.matches(in: text, range: range)
         for match in matches {
-            if let actionRange = Range(match.range(at: 1), in: text) {
-                actions.append(String(text[actionRange]))
+            guard let actionRange = Range(match.range(at: 1), in: text) else { continue }
+            let name = String(text[actionRange])
+            var count = 1
+            if match.numberOfRanges > 2,
+               let countRange = Range(match.range(at: 2), in: text),
+               let parsed = Int(text[countRange]) {
+                count = max(1, min(parsed, 8))
             }
+            actions.append((name, count))
         }
         let cleanText = regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
         return (cleanText, actions)

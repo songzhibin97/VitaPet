@@ -165,6 +165,7 @@ public actor OllamaService: AIEngineProtocol {
             let actionList = availableActions.joined(separator: "、")
             prompt += "\n你可以在回复中用 [ACTION:动作名] 标签来做动作。可用动作：\(actionList)。"
             prompt += "\n每次回复最多用一个动作标签。示例：好开心！[ACTION:celebrate]"
+            prompt += "\n部分动作支持次数后缀，如 somersault（翻跟头）：当用户要求翻 N 个跟头时使用 [ACTION:somersault:N]，N 取 1-8。"
         }
         let structuredBlock = buildStructuredMemoryBlock()
         if !structuredBlock.isEmpty {

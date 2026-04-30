@@ -139,6 +139,8 @@ public struct SpritePackBuilder: Sendable {
             return 0.5
         case .think:
             return 0.3
+        case .punch:
+            return 0.14
         default:
             return 0.2
         }

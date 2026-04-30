@@ -146,6 +146,10 @@ public extension OllamaTool {
                             type: "string",
                             description: "The action for the pet to perform",
                             enum: availableActions
+                        ),
+                        "count": OllamaToolProperty(
+                            type: "integer",
+                            description: "Optional repeat count for actions that support it (e.g. somersault). Default 1, max 8."
                         )
                     ],
                     required: ["action"]

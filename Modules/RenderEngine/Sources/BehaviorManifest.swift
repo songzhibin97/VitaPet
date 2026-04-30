@@ -99,6 +99,7 @@ public struct BehaviorManifest: Codable, Sendable {
                 "groom": staticBehavior("groom"),
                 "sit": staticBehavior("sit"),
                 "wave": staticBehavior("wave"),
+                "punch": staticBehavior("punch"),
                 "nod": staticBehavior("nod"),
                 "headShake": staticBehavior("headShake"),
                 "sneeze": staticBehavior("sneeze"),

@@ -92,7 +92,7 @@ final class AIProactiveTrigger {
 
             let (cleanText, actions) = AppDelegate.parseActionTags(from: response)
             for action in actions {
-                onAction(action)
+                onAction(action.name)
             }
 
             let trimmedText = cleanText.trimmingCharacters(in: .whitespacesAndNewlines)

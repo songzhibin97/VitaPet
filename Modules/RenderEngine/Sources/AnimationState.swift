@@ -46,4 +46,6 @@ public enum AnimationState: String, Sendable, CaseIterable {
     case pickup
     case land
     case type
+    case punch
+    case somersault
 }

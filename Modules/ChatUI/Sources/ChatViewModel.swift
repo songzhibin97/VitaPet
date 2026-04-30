@@ -312,6 +312,26 @@ public final class ChatViewModel {
         updateConversationPreview(for: id, using: message)
     }
 
+    /// 用清理后的内容替换最后一条助手消息（用于剥离 [ACTION:...] 标签）。
+    public func replaceLastAssistantContent(_ content: String) {
+        guard let id = selectedConversationId,
+              let last = currentMessages.last,
+              last.role == .assistant else {
+            return
+        }
+        let updated = ChatMessage(
+            id: last.id,
+            role: .assistant,
+            content: content,
+            timestamp: last.timestamp,
+            petId: last.petId,
+            petName: last.petName
+        )
+        currentMessages[currentMessages.count - 1] = updated
+        messagesByConversation[id] = currentMessages
+        updateConversationPreview(for: id, using: updated)
+    }
+
     /// Returns the captured "show thinking" value for a given message. Falls
     /// back to the current global toggle if a capture is missing (which only
     /// happens for messages that pre-date this mechanism).

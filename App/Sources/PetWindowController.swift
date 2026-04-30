@@ -39,6 +39,7 @@ public final class PetWindowController: NSWindowController {
     private var desktopBehaviorActive = false
     private var animationStateSnapshot: AnimationState = .idle
     private var lastRecordedState: String?
+    private var animationLockUntil: Date = .distantPast
     var behaviorWeightMultipliers: [String: Double] = [:]
     var windowDetector: (() -> [CGRect])?
     var soundManager: SoundManager?
@@ -730,6 +731,51 @@ public final class PetWindowController: NSWindowController {
         }
     }
 
+    /// 翻跟头期间用 NSWindow 平移制造「在屏幕上翻滚」的视觉效果。每翻 50px，朝向方向，越过 prep 才开始动。
+    private func startSomersaultRoll(flips: Int) {
+        guard let window else { return }
+        let facingSign: CGFloat = petScene.petNode.xScale < 0 ? -1 : 1
+        let pixelsPerFlip: CGFloat = 50
+        let totalDistance = pixelsPerFlip * CGFloat(flips) * facingSign
+
+        let startOrigin = window.frame.origin
+        var targetX = startOrigin.x + totalDistance
+        if let visible = (window.screen ?? NSScreen.main)?.visibleFrame {
+            let minX = visible.minX
+            let maxX = visible.maxX - window.frame.width
+            targetX = min(maxX, max(minX, targetX))
+        }
+        let actualDistance = targetX - startOrigin.x
+        guard abs(actualDistance) > 0.5 else { return }
+
+        movementTimer?.invalidate()
+        movementTimer = nil
+
+        let prepDelay = PetScene.somersaultPrepDuration
+        let rollDuration = Double(flips) * PetScene.somersaultPerFlipDuration
+        let fps: TimeInterval = 60
+        let steps = max(Int(rollDuration * fps), 1)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + prepDelay) { [weak self, weak window] in
+            guard let self, let window else { return }
+            let stepState = TimerStepState()
+            self.movementTimer?.invalidate()
+            self.movementTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / fps, repeats: true) { [weak self, weak window] timer in
+                stepState.value += 1
+                guard let self, let window else { timer.invalidate(); return }
+                let progress = min(1.0, Double(stepState.value) / Double(steps))
+                let x = startOrigin.x + actualDistance * CGFloat(progress)
+                window.setFrameOrigin(NSPoint(x: x, y: startOrigin.y))
+                self.repositionBubble()
+                if progress >= 1.0 {
+                    timer.invalidate()
+                    self.movementTimer = nil
+                    self.persistWindowPosition()
+                }
+            }
+        }
+    }
+
     func debugListBehaviors() -> [String] {
         Array(behaviorEngine.allBehaviorNames()).sorted()
     }
@@ -820,7 +866,9 @@ public final class PetWindowController: NSWindowController {
 
     func showAIBubble(_ text: String) {
         isThinking = false
-        applyAnimation(.chat)
+        if Date() >= animationLockUntil {
+            applyAnimation(.chat)
+        }
         let duration = max(3.0, Double(text.count) / 10.0)
         showBubble(text, duration: duration)
     }
@@ -853,9 +901,22 @@ public final class PetWindowController: NSWindowController {
         }
     }
 
-    func executeAIAction(_ action: String) {
+    func executeAIAction(_ action: String, count: Int = 1) {
         behaviorEngine.cancelCurrentBehavior()
         behaviorEngine.stopCursorTracking()
+
+        if action == AnimationState.somersault.rawValue {
+            let flips = max(1, min(count, 8))
+            let totalDuration = PetScene.somersaultTotalDuration(count: flips)
+            animationLockUntil = Date().addingTimeInterval(totalDuration + 0.15)
+            animationStateSnapshot = .somersault
+            soundManager?.playSound(for: action)
+            recordBehaviorChangeIfNeeded(for: .somersault)
+            Task { await stateMachine.forceState(.somersault) }
+            startSomersaultRoll(flips: flips)
+            petScene.playSomersault(count: flips)
+            return
+        }
 
         if let definition = behaviorEngine.behaviorDefinition(for: action),
            isMovementBehavior(definition.type) {

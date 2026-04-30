@@ -78,6 +78,7 @@
     "groom": { "type": "static", "animation": "groom" },
     "sit": { "type": "static", "animation": "sit" },
     "wave": { "type": "static", "animation": "wave" },
+    "punch": { "type": "static", "animation": "punch" },
     "nod": { "type": "static", "animation": "nod" },
     "headShake": { "type": "static", "animation": "headShake" },
     "sneeze": { "type": "static", "animation": "sneeze" },

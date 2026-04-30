@@ -101,11 +101,17 @@ echo "==> Built ${APP_DIR}"
 # Set INSTALL=0 to only produce dist/ (e.g. CI, or you’ll copy the .app yourself).
 if [ "${INSTALL:-1}" = "1" ]; then
   DEST="/Applications/${APP_BASENAME}"
+  echo "==> Quitting existing ${APP_NAME} (if running)"
+  osascript -e "tell application \"${APP_NAME}\" to quit" 2>/dev/null || true
+  sleep 1
+  killall "${BIN_NAME}" 2>/dev/null || true
+  sleep 0.5
+
   echo "==> Installing to ${DEST}"
   rm -rf "${DEST}"
   cp -R "${APP_DIR}" "${DEST}"
-  echo "==> Installed. Launch via Applications or:"
-  echo "    open \"${DEST}\""
+  echo "==> Restarting ${DEST}"
+  open "${DEST}"
   LEGACY="/Applications/${APP_NAME}-arm64.app"
   if [ -d "$LEGACY" ]; then
     echo "==> 旧包仍可手动删除: rm -rf \"${LEGACY}\""
