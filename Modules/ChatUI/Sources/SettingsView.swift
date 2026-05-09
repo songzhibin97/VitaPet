@@ -151,15 +151,56 @@ enum MCPSettingsSummary {
     static let placeholderJSON = "{\n  \"mcpServers\": {\n    \"filesystem\": {\n      \"type\": \"stdio\",\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/Users/me/Desktop\"]\n    }\n  }\n}"
 
     static func statusText(for json: String) -> String {
-        trimmed(json).isEmpty ? "未配置" : "已配置"
+        switch validationState(for: json) {
+        case .empty:
+            return "未配置"
+        case .valid:
+            return "已配置"
+        case .invalid:
+            return "配置无效"
+        }
     }
 
     static func descriptionText(for json: String) -> String {
-        trimmed(json).isEmpty ? "点击设置 MCP Servers" : "点击查看或编辑 MCP Servers"
+        switch validationState(for: json) {
+        case .empty:
+            return "点击设置 MCP Servers"
+        case .valid:
+            return "点击查看或编辑 MCP Servers"
+        case .invalid:
+            return "JSON 格式或字段无效，点击修正"
+        }
+    }
+
+    static func validationError(for json: String) -> String? {
+        if case .invalid(let message) = validationState(for: json) {
+            return message
+        }
+        return nil
     }
 
     private static func trimmed(_ json: String) -> String {
         json.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func validationState(for json: String) -> ValidationState {
+        let trimmedJSON = trimmed(json)
+        guard !trimmedJSON.isEmpty else {
+            return .empty
+        }
+
+        do {
+            _ = try MCPServerConfiguration.decodeList(from: trimmedJSON)
+            return .valid
+        } catch {
+            return .invalid(error.localizedDescription)
+        }
+    }
+
+    private enum ValidationState {
+        case empty
+        case valid
+        case invalid(String)
     }
 }
 
@@ -1812,6 +1853,11 @@ public struct SettingsView: View {
 
     private func saveMCPServers() {
         let normalizedDraft = mcpServersDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : mcpServersDraft
+        if let validationError = MCPSettingsSummary.validationError(for: normalizedDraft) {
+            errorMessage = "MCP 设置 JSON 无效：\(validationError)"
+            showError = true
+            return
+        }
         let didChange = normalizedDraft != mcpServersJSON
 
         mcpServersJSON = normalizedDraft

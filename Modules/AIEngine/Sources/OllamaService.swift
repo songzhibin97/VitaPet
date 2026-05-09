@@ -267,10 +267,10 @@ public actor OllamaService: AIEngineProtocol {
             request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
             applyOpenAIAuthorizationIfNeeded(to: &request)
 
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,
                   (200...299).contains(httpResponse.statusCode) else {
-                throw OllamaServiceError.httpStatus((response as? HTTPURLResponse)?.statusCode ?? -1)
+                throw Self.httpStatusError(response: response as? HTTPURLResponse, data: data)
             }
 
             currentStatus = .ready
@@ -289,11 +289,10 @@ public actor OllamaService: AIEngineProtocol {
                 request.timeoutInterval = 120
                 applyOpenAIAuthorizationIfNeeded(to: &request)
 
-                let (_, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await URLSession.shared.data(for: request)
                 guard let httpResponse = response as? HTTPURLResponse,
                       (200...299).contains(httpResponse.statusCode) else {
-                    let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
-                    currentStatus = .error("HTTP \(statusCode)")
+                    currentStatus = .error(Self.httpStatusError(response: response as? HTTPURLResponse, data: data).localizedDescription)
                     return
                 }
 
@@ -477,6 +476,17 @@ public actor OllamaService: AIEngineProtocol {
                     currentToolResults.append(result)
                     messages.append(Self.toolResultMessage(for: toolCall, content: result, backend: backend))
                 }
+                if let terminalFailureReply = Self.terminalToolFailureReply(for: currentToolResults) {
+                    return terminalFailureReply
+                }
+                if let failureReminder = Self.toolFailureReminder(for: currentToolResults) {
+                    messages.append(
+                        PayloadMessage(
+                            role: ChatMessage.Role.system.rawValue,
+                            content: failureReminder
+                        )
+                    )
+                }
                 previousToolCallSignatures = currentToolCallSignatures
                 lastToolResults = currentToolResults
                 continue
@@ -509,10 +519,10 @@ public actor OllamaService: AIEngineProtocol {
                 stream: false
             )
 
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse,
-                  (200...299).contains(httpResponse.statusCode) else {
-                throw OllamaServiceError.httpStatus((response as? HTTPURLResponse)?.statusCode ?? -1)
+                        let (data, response) = try await URLSession.shared.data(for: request)
+                        guard let httpResponse = response as? HTTPURLResponse,
+                                    (200...299).contains(httpResponse.statusCode) else {
+                                throw Self.httpStatusError(response: response as? HTTPURLResponse, data: data)
             }
             return try Self.parseChatResponse(data)
         case .openAICompatible:
@@ -525,10 +535,10 @@ public actor OllamaService: AIEngineProtocol {
             )
             applyOpenAIAuthorizationIfNeeded(to: &request)
 
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse,
-                  (200...299).contains(httpResponse.statusCode) else {
-                throw OllamaServiceError.httpStatus((response as? HTTPURLResponse)?.statusCode ?? -1)
+                        let (data, response) = try await URLSession.shared.data(for: request)
+                        guard let httpResponse = response as? HTTPURLResponse,
+                                    (200...299).contains(httpResponse.statusCode) else {
+                                throw Self.httpStatusError(response: response as? HTTPURLResponse, data: data)
             }
             return try Self.parseOpenAIChatResponse(data)
         }
@@ -1061,7 +1071,11 @@ public actor OllamaService: AIEngineProtocol {
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             if let httpResponse = response as? HTTPURLResponse {
-                throw OllamaServiceError.httpStatus(httpResponse.statusCode)
+                var responseData = Data()
+                for try await byte in bytes {
+                    responseData.append(byte)
+                }
+                throw Self.httpStatusError(response: httpResponse, data: responseData)
             }
             throw OllamaServiceError.invalidResponse
         }
@@ -1115,7 +1129,7 @@ public actor OllamaService: AIEngineProtocol {
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             if let httpResponse = response as? HTTPURLResponse {
-                throw OllamaServiceError.httpStatus(httpResponse.statusCode)
+                throw Self.httpStatusError(response: httpResponse, data: data)
             }
             throw OllamaServiceError.invalidResponse
         }
@@ -1234,12 +1248,109 @@ public actor OllamaService: AIEngineProtocol {
     }
 
     private static func defaultFailedToolResult(_ toolName: String, message: String) -> String {
+        let normalizedMessage = normalizedToolFailureMessage(message)
         let payload = JSONValue.object([
             "status": .string("error"),
             "tool": .string(toolName),
-            "message": .string(message)
+            "message": .string(normalizedMessage)
         ])
         return payload.compactJSONString() ?? "{\"status\":\"error\"}"
+    }
+
+    private static func normalizedToolFailureMessage(_ message: String) -> String {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "Tool execution failed."
+        }
+
+        if isAuthenticationFailureMessage(trimmed) {
+            return "MCP server authentication failed. Check the Authorization header or token in MCP settings and try again."
+        }
+
+        return trimmed
+    }
+
+    private static func toolFailureReminder(for results: [String]) -> String? {
+        guard results.contains(where: hasFailedToolResult) else {
+            return nil
+        }
+
+        var reminder = "One or more tool calls failed. Do not claim you completed the task manually, wrote it yourself, or already finished the requested action. Reply directly to the user based on the tool result."
+        if results.contains(where: isAuthenticationFailureResult) {
+            reminder += " If the failure is about authentication or authorization, tell the user to check the MCP Authorization header or token in settings and retry."
+        }
+        return reminder
+    }
+
+    private static func terminalToolFailureReply(for results: [String]) -> String? {
+        guard results.contains(where: isAuthenticationFailureResult) else {
+            return nil
+        }
+
+        let summary = summarizedToolResults(results)
+        if !summary.isEmpty {
+            return summary
+        }
+
+        return "MCP server authentication failed. Check the Authorization header or token in MCP settings and try again."
+    }
+
+    private static func hasFailedToolResult(_ rawResult: String) -> Bool {
+        let trimmed = rawResult.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return false
+        }
+
+        if let object = parsedToolResultObject(from: trimmed) {
+            if object["status"]?.stringValue?.lowercased() == "error" {
+                return true
+            }
+            if object["isError"]?.boolValue == true {
+                return true
+            }
+        }
+
+        return trimmed.localizedCaseInsensitiveContains("tool execution failed")
+    }
+
+    private static func isAuthenticationFailureResult(_ rawResult: String) -> Bool {
+        let trimmed = rawResult.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return false
+        }
+
+        if let object = parsedToolResultObject(from: trimmed),
+           let message = object["message"]?.stringValue,
+           !message.isEmpty {
+            return isAuthenticationFailureMessage(message)
+        }
+
+        return isAuthenticationFailureMessage(trimmed)
+    }
+
+    private static func isAuthenticationFailureMessage(_ message: String) -> Bool {
+        let normalized = message.lowercased()
+        let indicators = [
+            "authentication",
+            "authorization",
+            "unauthorized",
+            "forbidden",
+            "401",
+            "403",
+            "invalid api key",
+            "access denied"
+        ]
+        return indicators.contains { normalized.contains($0) }
+    }
+
+    private static func parsedToolResultObject(from text: String) -> [String: JSONValue]? {
+        guard let data = text.data(using: .utf8),
+              let jsonObject = try? JSONSerialization.jsonObject(with: data),
+              let jsonValue = JSONValue.fromJSONObject(jsonObject) else {
+            return nil
+        }
+
+        return jsonValue.objectValue
     }
 
     private static func summarizedToolResults(_ results: [String]) -> String {
@@ -1415,6 +1526,41 @@ public actor OllamaService: AIEngineProtocol {
             return String(path.dropLast())
         }
         return path
+    }
+
+    private nonisolated static func httpStatusError(response: HTTPURLResponse?, data: Data? = nil) -> OllamaServiceError {
+        OllamaServiceError.httpStatus(response?.statusCode ?? -1, httpErrorMessage(from: data))
+    }
+
+    private nonisolated static func httpErrorMessage(from data: Data?) -> String? {
+        guard let data, !data.isEmpty else {
+            return nil
+        }
+
+        if let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let errorObject = jsonObject["error"] as? [String: Any],
+               let message = errorObject["message"] as? String,
+               !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return message.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            if let message = jsonObject["message"] as? String,
+               !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return message.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            if let error = jsonObject["error"] as? String,
+               !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return error.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        guard let body = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !body.isEmpty else {
+            return nil
+        }
+
+        return body
     }
 
     internal nonisolated static func parseOpenAIChatResponse(_ data: Data) throws -> ParsedChunk {
@@ -1760,7 +1906,7 @@ public actor OllamaService: AIEngineProtocol {
 
 public enum OllamaServiceError: LocalizedError {
     case serviceUnavailable
-    case httpStatus(Int)
+    case httpStatus(Int, String?)
     case invalidResponse
     case incompleteStream
     case toolLoopLimitExceeded
@@ -1768,15 +1914,18 @@ public enum OllamaServiceError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .serviceUnavailable:
-            "Ollama service is not configured or unavailable"
-        case .httpStatus(let status):
-            "Ollama API returned HTTP status: \(status)"
+            return "Ollama service is not configured or unavailable"
+        case .httpStatus(let status, let body):
+            if let body, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "Ollama API returned HTTP status \(status): \(body)"
+            }
+            return "Ollama API returned HTTP status: \(status)"
         case .invalidResponse:
-            "Ollama API returned invalid response"
+            return "Ollama API returned invalid response"
         case .incompleteStream:
-            "Ollama streaming response did not contain completion marker"
+            return "Ollama streaming response did not contain completion marker"
         case .toolLoopLimitExceeded:
-            "Tool calling exceeded the maximum number of rounds"
+            return "Tool calling exceeded the maximum number of rounds"
         }
     }
 }

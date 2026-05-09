@@ -121,15 +121,118 @@ actor MCPClient {
             throw MCPClientError.unknownTool(name)
         }
 
+        let normalizedArguments = Self.normalizedArguments(arguments, using: descriptor.inputSchema)
+
         let result = try await sendRequest(
             method: "tools/call",
             params: .object([
                 "name": .string(descriptor.originalName),
-                "arguments": .object(arguments)
+                "arguments": .object(normalizedArguments)
             ])
         )
 
         return Self.renderToolCallResult(result)
+    }
+
+    private static func normalizedArguments(_ arguments: [String: JSONValue], using inputSchema: JSONValue) -> [String: JSONValue] {
+        guard let schema = inputSchema.objectValue,
+              let properties = schema["properties"]?.objectValue else {
+            return arguments
+        }
+
+        var normalized = arguments
+        for (key, value) in arguments {
+            normalized[key] = normalizedValue(value, schema: properties[key])
+        }
+        return normalized
+    }
+
+    private static func normalizedValue(_ value: JSONValue, schema: JSONValue?) -> JSONValue {
+        guard let schemaObject = schema?.objectValue else {
+            return value
+        }
+
+        let types = schemaTypes(from: schemaObject)
+
+        if types.contains("object"),
+           let object = value.objectValue,
+           let properties = schemaObject["properties"]?.objectValue {
+            var normalizedObject: [String: JSONValue] = object
+            for (key, nestedValue) in object {
+                normalizedObject[key] = normalizedValue(nestedValue, schema: properties[key])
+            }
+            return .object(normalizedObject)
+        }
+
+        if types.contains("array"),
+           let array = value.arrayValue,
+           let itemSchema = schemaObject["items"] {
+            return .array(array.map { normalizedValue($0, schema: itemSchema) })
+        }
+
+        if types.contains("integer"), let integerValue = integerValue(from: value) {
+            return .number(Double(integerValue))
+        }
+
+        if types.contains("number"), let numberValue = numberValue(from: value) {
+            return .number(numberValue)
+        }
+
+        if types.contains("boolean"), let boolValue = value.boolValue {
+            return .bool(boolValue)
+        }
+
+        if types.contains("string"), let stringValue = value.stringValue {
+            return .string(stringValue)
+        }
+
+        return value
+    }
+
+    private static func schemaTypes(from schemaObject: [String: JSONValue]) -> Set<String> {
+        if let typeName = schemaObject["type"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !typeName.isEmpty {
+            return [typeName.lowercased()]
+        }
+
+        if let typeArray = schemaObject["type"]?.arrayValue {
+            let values = typeArray.compactMap {
+                $0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            }
+            return Set(values.filter { !$0.isEmpty })
+        }
+
+        return []
+    }
+
+    private static func integerValue(from value: JSONValue) -> Int? {
+        if let integer = value.intValue {
+            return integer
+        }
+
+        if let boolValue = value.boolValue {
+            return boolValue ? 1 : 0
+        }
+
+        if let stringValue = value.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let integer = Int(stringValue) {
+            return integer
+        }
+
+        return nil
+    }
+
+    private static func numberValue(from value: JSONValue) -> Double? {
+        switch value {
+        case .number(let number):
+            return number
+        case .bool(let boolValue):
+            return boolValue ? 1 : 0
+        case .string(let stringValue):
+            return Double(stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        case .object, .array, .null:
+            return nil
+        }
     }
 
     func close() async {

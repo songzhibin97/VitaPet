@@ -578,6 +578,58 @@ final class OllamaServiceTests: XCTestCase {
         await fulfillment(of: [modelsObserved, completionsObserved], timeout: 1.0)
     }
 
+    func testSend_openAICompatibleBackendIncludesErrorBodyForHTTP400() async throws {
+        let service = OllamaService(
+            endpoint: URL(string: "http://unit.test")!,
+            model: "auto",
+            backend: .openAICompatible
+        )
+
+        OllamaServiceURLProtocol.install { request in
+            if request.url?.path == "/v1/models" {
+                let response = HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                return (response, Data(#"{"data":[]}"#.utf8))
+            }
+
+            if request.url?.path == "/v1/chat/completions" {
+                let response = HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 400,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                let payload = Data(
+                    #"{"error":{"message":"messages with role 'tool' must follow a preceding assistant tool_calls message"}}"#.utf8
+                )
+                return (response, payload)
+            }
+
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 404,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            return (response, Data())
+        }
+
+        do {
+            let stream = try await service.send(message: "你好")
+            for try await _ in stream {}
+            XCTFail("Expected request to fail")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Ollama API returned HTTP status 400: messages with role 'tool' must follow a preceding assistant tool_calls message"
+            )
+        }
+    }
+
     func testUpdateConfig() async {
         let service = OllamaService(
             endpoint: URL(string: "http://localhost:11434")!,
@@ -797,6 +849,64 @@ final class OllamaServiceTests: XCTestCase {
         await fulfillment(of: [completionRequestsObserved], timeout: 1.0)
     }
 
+    func testSendWithTools_returnsDirectSummaryAfterAuthenticationFailure() async throws {
+        let service = OllamaService(
+            endpoint: URL(string: "http://unit.test")!,
+            model: "auto",
+            backend: .openAICompatible
+        )
+        let completionRequestsObserved = expectation(description: "auth failure tool loop request observed")
+        completionRequestsObserved.expectedFulfillmentCount = 1
+
+        let ownerTool = OllamaTool.mcpTool(
+            name: "draft_for_owner",
+            description: "Prepare content for the owner.",
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([:])
+            ])
+        )
+
+        OllamaServiceURLProtocol.install { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+
+            if request.url?.path == "/v1/models" {
+                return (response, Data(#"{"data":[]}"#.utf8))
+            }
+
+            if request.url?.path == "/v1/chat/completions" {
+                completionRequestsObserved.fulfill()
+                let payload = Data(
+                    #"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"draft_for_owner","arguments":"{}"}}]}}]}"#.utf8
+                )
+                return (response, payload)
+            }
+
+            return (response, Data("{}".utf8))
+        }
+
+        let stream = try await service.sendWithTools(
+            message: "帮 owner 写一段内容",
+            tools: [ownerTool],
+            onToolCall: { _ in
+                #"{"status":"error","tool":"draft_for_owner","message":"MCP server authentication failed. Check the Authorization header or token in MCP settings and try again."}"#
+            }
+        )
+
+        var collected = ""
+        for try await chunk in stream {
+            collected += chunk
+        }
+
+        XCTAssertEqual(collected, "MCP server authentication failed. Check the Authorization header or token in MCP settings and try again.")
+        await fulfillment(of: [completionRequestsObserved], timeout: 1.0)
+    }
+
     func testMCPServerConfigurationDecodeList_acceptsNamedStreamableHTTPServers() throws {
         let json = #"""
         {
@@ -962,5 +1072,102 @@ final class OllamaServiceTests: XCTestCase {
         let recordedMethods = requestMethods
         requestOrderLock.unlock()
         XCTAssertEqual(recordedMethods, ["initialize", "notifications/initialized", "tools/list", "tools/call"])
+    }
+
+    func testMCPClient_coercesBooleanToNumberWhenSchemaRequiresNumber() async throws {
+        let configuration = MCPServerConfiguration(
+            name: "trip-mcp",
+            transport: .streamableHTTP,
+            url: "https://unit.test/mcp"
+        )
+        let client = MCPClient(configuration: configuration)
+
+        OllamaServiceURLProtocol.install { request in
+            let responseURL = try XCTUnwrap(request.url)
+            let body = try XCTUnwrap(request.bodyDataForTesting())
+            let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+            let method = try XCTUnwrap(object["method"] as? String)
+
+            switch method {
+            case "initialize":
+                let response = HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: [
+                        "Content-Type": "application/json",
+                        "Mcp-Session-Id": "session-1"
+                    ]
+                )!
+                let payload = Data(
+                    #"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"trip-mcp","version":"1.0.0"}}}"#.utf8
+                )
+                return (response, payload)
+
+            case "notifications/initialized":
+                let response = HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 202,
+                    httpVersion: nil,
+                    headerFields: [
+                        "Content-Type": "application/json",
+                        "Mcp-Session-Id": "session-1"
+                    ]
+                )!
+                return (response, Data())
+
+            case "tools/list":
+                let response = HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: [
+                        "Content-Type": "application/json",
+                        "Mcp-Session-Id": "session-1"
+                    ]
+                )!
+                let payload = Data(
+                    #"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"plan-trip","description":"Plan a trip","inputSchema":{"type":"object","properties":{"peopleCount":{"type":"number"}},"required":["peopleCount"]}}]}}"#.utf8
+                )
+                return (response, payload)
+
+            case "tools/call":
+                let params = try XCTUnwrap(object["params"] as? [String: Any])
+                let arguments = try XCTUnwrap(params["arguments"] as? [String: Any])
+                XCTAssertEqual(arguments["peopleCount"] as? Int, 1)
+
+                let response = HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: [
+                        "Content-Type": "application/json",
+                        "Mcp-Session-Id": "session-1"
+                    ]
+                )!
+                let payload = Data(
+                    #"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"1 traveler planned"}]}}"#.utf8
+                )
+                return (response, payload)
+
+            default:
+                XCTFail("Unexpected MCP method: \(method)")
+                let response = HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 500,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                return (response, Data())
+            }
+        }
+
+        let result = try await client.callExposedTool(
+            "mcp_trip_mcp_plan_trip",
+            arguments: ["peopleCount": .bool(true)]
+        )
+
+        XCTAssertEqual(result, "1 traveler planned")
+        await client.close()
     }
 }
