@@ -75,6 +75,16 @@ public actor DatabaseManager {
         // Migration: add pet columns to conversation_turns
         try? Self.execute("ALTER TABLE conversation_turns ADD COLUMN pet_id TEXT", in: database)
         try? Self.execute("ALTER TABLE conversation_turns ADD COLUMN pet_name TEXT", in: database)
+
+        // Migration: structured memory metadata
+        try? Self.execute("ALTER TABLE ai_memories ADD COLUMN content_hash TEXT", in: database)
+        try? Self.execute("ALTER TABLE ai_memories ADD COLUMN remote_id TEXT", in: database)
+        try? Self.execute("ALTER TABLE ai_memories ADD COLUMN synced_at REAL", in: database)
+        try? Self.execute("ALTER TABLE ai_memories ADD COLUMN source TEXT DEFAULT 'auto'", in: database)
+        try? Self.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_memories_content_hash ON ai_memories(content_hash);",
+            in: database
+        )
     }
 
     private func getOrOpenDatabase() throws -> OpaquePointer? {
@@ -712,13 +722,71 @@ public actor DatabaseManager {
         try Self.step(deleteTurnsStatement, in: database)
     }
 
-    public func insertMemory(content: String, category: String, importance: Int = 1) async throws {
+    public struct MemoryRecord: Sendable, Equatable {
+        public let id: Int64
+        public let content: String
+        public let category: String
+        public let importance: Int
+        public let createdAt: Date
+        public let source: String
+        public let remoteId: String?
+        public let syncedAt: Date?
+
+        public init(
+            id: Int64,
+            content: String,
+            category: String,
+            importance: Int,
+            createdAt: Date,
+            source: String,
+            remoteId: String?,
+            syncedAt: Date?
+        ) {
+            self.id = id
+            self.content = content
+            self.category = category
+            self.importance = importance
+            self.createdAt = createdAt
+            self.source = source
+            self.remoteId = remoteId
+            self.syncedAt = syncedAt
+        }
+    }
+
+    @discardableResult
+    public func insertMemory(
+        content: String,
+        category: String,
+        importance: Int = 1,
+        source: String = "auto",
+        contentHash: String? = nil
+    ) async throws -> Int64 {
         let database = try getOrOpenDatabase()
+
+        // Upsert-like: reject duplicates at DB level via unique index on content_hash.
+        // If a hash is provided and already exists, bump importance if higher and return existing row.
+        if let contentHash, !contentHash.isEmpty {
+            if let existing = try fetchMemory(byHash: contentHash, database: database) {
+                if importance > existing.importance {
+                    let update = try Self.prepare(
+                        "UPDATE ai_memories SET importance = ? WHERE id = ?;",
+                        in: database
+                    )
+                    defer { sqlite3_finalize(update) }
+                    try Self.bind(int: importance, at: 1, in: update, database: database)
+                    guard sqlite3_bind_int64(update, 2, existing.id) == SQLITE_OK else {
+                        throw Self.sqliteError(in: database)
+                    }
+                    try Self.step(update, in: database)
+                }
+                return existing.id
+            }
+        }
 
         let statement = try Self.prepare(
             """
-            INSERT INTO ai_memories (content, category, created_at, importance)
-            VALUES (?, ?, ?, ?);
+            INSERT INTO ai_memories (content, category, created_at, importance, content_hash, source)
+            VALUES (?, ?, ?, ?, ?, ?);
             """,
             in: database
         )
@@ -730,15 +798,45 @@ public actor DatabaseManager {
             throw Self.sqliteError(in: database)
         }
         try Self.bind(int: importance, at: 4, in: statement, database: database)
+        if let contentHash, !contentHash.isEmpty {
+            try Self.bind(text: contentHash, at: 5, in: statement)
+        } else {
+            sqlite3_bind_null(statement, 5)
+        }
+        try Self.bind(text: source, at: 6, in: statement)
+        try Self.step(statement, in: database)
+
+        return sqlite3_last_insert_rowid(database)
+    }
+
+    public func markMemorySynced(id: Int64, remoteId: String?) async throws {
+        let database = try getOrOpenDatabase()
+        let statement = try Self.prepare(
+            "UPDATE ai_memories SET remote_id = ?, synced_at = ? WHERE id = ?;",
+            in: database
+        )
+        defer { sqlite3_finalize(statement) }
+
+        if let remoteId {
+            try Self.bind(text: remoteId, at: 1, in: statement)
+        } else {
+            sqlite3_bind_null(statement, 1)
+        }
+        guard sqlite3_bind_double(statement, 2, Date().timeIntervalSince1970) == SQLITE_OK else {
+            throw Self.sqliteError(in: database)
+        }
+        guard sqlite3_bind_int64(statement, 3, id) == SQLITE_OK else {
+            throw Self.sqliteError(in: database)
+        }
         try Self.step(statement, in: database)
     }
 
-    public func fetchMemories(limit: Int = 20) async throws -> [(id: Int64, content: String, category: String)] {
+    public func fetchMemoryRecords(limit: Int = 20) async throws -> [MemoryRecord] {
         let database = try getOrOpenDatabase()
-
         let statement = try Self.prepare(
             """
-            SELECT id, content, category
+            SELECT id, content, category, importance, created_at,
+                   COALESCE(source, 'auto'), remote_id, synced_at
             FROM ai_memories
             ORDER BY importance DESC, created_at DESC
             LIMIT ?;
@@ -746,27 +844,191 @@ public actor DatabaseManager {
             in: database
         )
         defer { sqlite3_finalize(statement) }
-
         try Self.bind(int: limit, at: 1, in: statement, database: database)
+        return try collectMemoryRows(from: statement, database: database)
+    }
 
-        var memories: [(id: Int64, content: String, category: String)] = []
+    /// Count of rows that were never successfully acknowledged by the remote worker.
+    public func unsyncedMemoryCount() async throws -> Int {
+        let database = try getOrOpenDatabase()
+        let statement = try Self.prepare(
+            "SELECT COUNT(*) FROM ai_memories WHERE synced_at IS NULL;",
+            in: database
+        )
+        defer { sqlite3_finalize(statement) }
+
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW:
+            return Int(sqlite3_column_int64(statement, 0))
+        case SQLITE_DONE:
+            return 0
+        default:
+            throw Self.sqliteError(in: database)
+        }
+    }
+
+    /// Rows that were never successfully acknowledged by the remote worker (`synced_at` unset).
+    public func fetchUnsyncedMemoryRecords(limit: Int = 200) async throws -> [MemoryRecord] {
+        let database = try getOrOpenDatabase()
+        let capped = max(1, min(500, limit))
+        let statement = try Self.prepare(
+            """
+            SELECT id, content, category, importance, created_at,
+                   COALESCE(source, 'auto'), remote_id, synced_at
+            FROM ai_memories
+            WHERE synced_at IS NULL
+            ORDER BY created_at ASC
+            LIMIT ?;
+            """,
+            in: database
+        )
+        defer { sqlite3_finalize(statement) }
+        try Self.bind(int: capped, at: 1, in: statement, database: database)
+        return try collectMemoryRows(from: statement, database: database)
+    }
+
+    public func searchMemoryRecords(keyword: String, limit: Int = 50) async throws -> [MemoryRecord] {
+        let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return try await fetchMemoryRecords(limit: limit)
+        }
+
+        let database = try getOrOpenDatabase()
+        let statement = try Self.prepare(
+            """
+            SELECT id, content, category, importance, created_at,
+                   COALESCE(source, 'auto'), remote_id, synced_at
+            FROM ai_memories
+            WHERE content LIKE ? OR category LIKE ?
+            ORDER BY importance DESC, created_at DESC
+            LIMIT ?;
+            """,
+            in: database
+        )
+        defer { sqlite3_finalize(statement) }
+        let pattern = "%\(trimmed)%"
+        try Self.bind(text: pattern, at: 1, in: statement)
+        try Self.bind(text: pattern, at: 2, in: statement)
+        try Self.bind(int: limit, at: 3, in: statement, database: database)
+        return try collectMemoryRows(from: statement, database: database)
+    }
+
+    public func memoryExists(contentHash: String) async throws -> Bool {
+        let database = try getOrOpenDatabase()
+        return try fetchMemory(byHash: contentHash, database: database) != nil
+    }
+
+    public func fetchMemories(limit: Int = 20) async throws -> [(id: Int64, content: String, category: String)] {
+        try await fetchMemoryRecords(limit: limit).map { ($0.id, $0.content, $0.category) }
+    }
+
+    private func fetchMemory(byHash hash: String, database: OpaquePointer?) throws -> MemoryRecord? {
+        let statement = try Self.prepare(
+            """
+            SELECT id, content, category, importance, created_at,
+                   COALESCE(source, 'auto'), remote_id, synced_at
+            FROM ai_memories
+            WHERE content_hash = ?
+            LIMIT 1;
+            """,
+            in: database
+        )
+        defer { sqlite3_finalize(statement) }
+        try Self.bind(text: hash, at: 1, in: statement)
+        return try collectMemoryRows(from: statement, database: database).first
+    }
+
+    private func collectMemoryRows(from statement: OpaquePointer?, database: OpaquePointer?) throws -> [MemoryRecord] {
+        var records: [MemoryRecord] = []
         while true {
             let result = sqlite3_step(statement)
             switch result {
             case SQLITE_ROW:
-                memories.append(
-                    (
-                        id: sqlite3_column_int64(statement, 0),
-                        content: Self.columnText(at: 1, in: statement),
-                        category: Self.columnText(at: 2, in: statement)
+                let id = sqlite3_column_int64(statement, 0)
+                let content = Self.columnText(at: 1, in: statement)
+                let category = Self.columnText(at: 2, in: statement)
+                let importance = Int(sqlite3_column_int(statement, 3))
+                let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 4))
+                let source = Self.columnText(at: 5, in: statement)
+                let remoteId = sqlite3_column_type(statement, 6) == SQLITE_NULL
+                    ? nil : Self.columnText(at: 6, in: statement)
+                let syncedAt = sqlite3_column_type(statement, 7) == SQLITE_NULL
+                    ? nil : Date(timeIntervalSince1970: sqlite3_column_double(statement, 7))
+                records.append(
+                    MemoryRecord(
+                        id: id,
+                        content: content,
+                        category: category,
+                        importance: importance,
+                        createdAt: createdAt,
+                        source: source,
+                        remoteId: remoteId,
+                        syncedAt: syncedAt
                     )
                 )
             case SQLITE_DONE:
-                return memories
+                return records
             default:
                 throw Self.sqliteError(in: database)
             }
         }
+    }
+
+    private static let stableMemoryHashMigrationDefaultsKey = "VitaPet.didMigrateStableMemoryHashes_v1"
+
+    /// One-time: stable SHA256 hashes + drop extra rows that duplicated the same normalized content under old unstable hashes.
+    public func migrateMemoryHashesToStableFingerprintIfNeeded() async throws {
+        guard !UserDefaults.standard.bool(forKey: Self.stableMemoryHashMigrationDefaultsKey) else {
+            return
+        }
+        let database = try getOrOpenDatabase()
+        let all = try fetchAllMemoryRecordsForMigration(database: database)
+        let sorted = all.sorted { lhs, rhs in
+            if lhs.importance != rhs.importance {
+                return lhs.importance > rhs.importance
+            }
+            if lhs.createdAt != rhs.createdAt {
+                return lhs.createdAt > rhs.createdAt
+            }
+            return lhs.id > rhs.id
+        }
+        var seenHashes = Set<String>()
+        for record in sorted {
+            let hash = MemoryContentHasher.stableHash(record.content)
+            if seenHashes.contains(hash) {
+                try await deleteMemory(id: record.id)
+                continue
+            }
+            seenHashes.insert(hash)
+            try updateMemoryContentHash(id: record.id, hash: hash, database: database)
+        }
+        UserDefaults.standard.set(true, forKey: Self.stableMemoryHashMigrationDefaultsKey)
+    }
+
+    private func fetchAllMemoryRecordsForMigration(database: OpaquePointer?) throws -> [MemoryRecord] {
+        let statement = try Self.prepare(
+            """
+            SELECT id, content, category, importance, created_at,
+                   COALESCE(source, 'auto'), remote_id, synced_at
+            FROM ai_memories;
+            """,
+            in: database
+        )
+        defer { sqlite3_finalize(statement) }
+        return try collectMemoryRows(from: statement, database: database)
+    }
+
+    private func updateMemoryContentHash(id: Int64, hash: String, database: OpaquePointer?) throws {
+        let statement = try Self.prepare(
+            "UPDATE ai_memories SET content_hash = ? WHERE id = ?;",
+            in: database
+        )
+        defer { sqlite3_finalize(statement) }
+        try Self.bind(text: hash, at: 1, in: statement)
+        guard sqlite3_bind_int64(statement, 2, id) == SQLITE_OK else {
+            throw Self.sqliteError(in: database)
+        }
+        try Self.step(statement, in: database)
     }
 
     public func deleteMemory(id: Int64) async throws {

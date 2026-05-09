@@ -264,6 +264,7 @@ public actor SpritePackManager {
             .groom: 0.2,
             .sit: 0.5,
             .wave: 0.2,
+            .punch: 0.14,
             .nod: 0.2,
             .headShake: 0.2,
             .sneeze: 0.15,
@@ -282,7 +283,8 @@ public actor SpritePackManager {
             .hidePeek: 0.2,
             .pickup: 0.15,
             .land: 0.15,
-            .type: 0.15
+            .type: 0.15,
+            .somersault: 0.15
         ]
         let loopingStates: Set<AnimationState> = [.idle, .walk, .run, .follow, .sleep, .sit, .dance, .type, .read, .write, .phone]
 

@@ -12,6 +12,12 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private struct PreparedConversationRequest {
+        let stream: AsyncThrowingStream<String, Error>
+        let targetPets: [PetIdentity]
+        let isGroupChat: Bool
+    }
+
     private var petWindowControllers: [UUID: PetWindowController] = [:]
     private var chatViewModel: ChatViewModel!
     private var chatController: ChatWindowController!
@@ -19,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var inputBarController: InputBarWindowController!
     private let eventBus = EventBus()
     private var timerSource: TimerSource!
+    private var hourBoundaryTimer: HourBoundaryTimerSource!
     private var workspaceMonitor: WorkspaceMonitor!
     private var notificationMonitor: NotificationMonitor!
     private var githubMonitor: GitHubMonitor!
@@ -38,12 +45,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var aiProactiveTrigger: AIProactiveTrigger?
     private var aiStatus: AIEngine.AIEngineStatus = .notConfigured
     private var ollamaService: OllamaService?
+    private var memoryWorkerService: MemoryWorkerService?
     private var interactionManager: PetInteractionManager!
     private var desktopAwareness = DesktopAwarenessController()
     private var timeWeatherController = TimeWeatherController()
     private var miniGameManager = MiniGameManager()
     private var pomodoroController = PomodoroController()
     private var conversationTurnCount = 0
+    private var chatPathSomersaultFired = false
+    private var chatPathToolActionFired = false
+    private static let memoryExtractionEveryNTurns = 2
+    private var memoryRemoteSyncTask: Task<Void, Never>?
+    /// 周期性把本地未同步的记忆推到远端，避免单次失败后只能等下次抽取/重启才重传。
+    private static let memoryRemoteFlushInterval: UInt64 = 10 * 60 * 1_000_000_000
     private let maximumPets = 5
     private let windowDetector = WindowDetector()
 
@@ -56,9 +70,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         aiProactiveTrigger?.stop()
         timeWeatherController.stop()
+        memoryRemoteSyncTask?.cancel()
+        memoryRemoteSyncTask = nil
         VitaPetApp.releaseAppLock()
 
         let timerSource = timerSource
+        let hourBoundaryTimer = hourBoundaryTimer
         let sitReminderTimer = sitReminderTimer
         let workspaceMonitor = workspaceMonitor
         let notificationMonitor = notificationMonitor
@@ -73,6 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             await timerSource?.stop()
+            await hourBoundaryTimer?.stop()
             await sitReminderTimer?.stop()
             await workspaceMonitor?.stop()
             await notificationMonitor?.stop()
@@ -94,12 +112,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let configManager = ConfigManager()
         let databaseManager = DatabaseManager()
         L10n.locale = configManager.config.locale
-        let initialEndpoint = URL(string: configManager.config.ollamaEndpoint) ?? URL(string: "http://localhost:11434")!
+        installMainMenuIfNeeded()
+        let initialEndpointValue = Self.normalizedAIEndpoint(configManager.config.ollamaEndpoint)
+        let initialBackend = Self.inferredAIBackend(
+            preferred: Self.resolvedAIBackend(from: configManager.config.aiBackend),
+            endpointValue: initialEndpointValue
+        )
+        let initialModel = Self.normalizedAIModel(configManager.config.ollamaModel, backend: initialBackend)
+        let initialMCPServers = Self.decodedMCPServers(from: configManager.config.mcpServersJSON)
+        let initialEndpoint = URL(string: initialEndpointValue) ?? URL(string: "http://localhost:11434")!
         let ollamaService = OllamaService(
             endpoint: initialEndpoint,
-            model: configManager.config.ollamaModel
+            model: initialModel,
+            backend: initialBackend,
+            openAIApiKey: configManager.config.openAIApiKey
         )
         self.ollamaService = ollamaService
+        let initialMemoryConfig = Self.memoryWorkerConfig(from: configManager.config)
+        if initialMemoryConfig.enabled {
+            self.memoryWorkerService = MemoryWorkerService(config: initialMemoryConfig)
+        } else {
+            self.memoryWorkerService = nil
+        }
+        await ollamaService.updateMCPServers(initialMCPServers)
         await ollamaService.updateSystemPrompt(configManager.config.aiSystemPrompt)
 
         Task {
@@ -108,33 +143,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let chatViewModel = ChatViewModel(
-            sendToAI: { message, _ in
-                try await ollamaService.send(message: message)
+            sendToAI: { [weak self] message, _ in
+                guard let self else {
+                    throw OllamaServiceError.serviceUnavailable
+                }
+
+                guard let chatViewModel = await MainActor.run(body: { self.chatViewModel }) else {
+                    throw OllamaServiceError.serviceUnavailable
+                }
+
+                let targetPetIDs = await MainActor.run {
+                    self.resolvedConversationTargetPetIDs(for: chatViewModel)
+                }
+                let sessionId = await MainActor.run {
+                    chatViewModel.selectedConversationId
+                        ?? self.fallbackConversationId(for: targetPetIDs)
+                        ?? "default"
+                }
+                let userSomersaultCount = await MainActor.run {
+                    Self.parseSomersaultCount(from: message)
+                }
+                let preparedRequest = try await self.prepareConversationRequest(
+                    text: message,
+                    targetPetIDs: targetPetIDs,
+                    sessionId: sessionId,
+                    userSomersaultCount: userSomersaultCount,
+                    markChatToolActions: true
+                )
+                return preparedRequest.stream
             },
             getAIStatus: {
                 Self.chatUIStatus(from: await ollamaService.status)
             }
         )
         self.chatViewModel = chatViewModel
-        chatViewModel.onUserSent = { [weak self] in
+        chatViewModel.onUserSent = { [weak self, weak chatViewModel] in
             Task { @MainActor in
                 guard let self else {
                     return
                 }
 
+                // 用户输入快路径：识别「翻N个跟头」直接触发，不依赖模型
+                if let lastUser = chatViewModel?.currentMessages.last(where: { $0.role == .user })?.content,
+                   let count = Self.parseSomersaultCount(from: lastUser) {
+                    self.chatPathSomersaultFired = true
+                    for controller in self.petWindowControllers.values {
+                        controller.executeAIAction("somersault", count: count)
+                    }
+                    return  // somersault is its own reaction, skip generic userInteract
+                }
+
+                self.chatPathSomersaultFired = false
+                self.chatPathToolActionFired = false
                 for controller in self.petWindowControllers.values {
                     await controller.handleAnimationTrigger(.userInteract)
                 }
             }
         }
-        chatViewModel.onAssistantReplied = { [weak self] in
+        chatViewModel.onAssistantReplied = { [weak self, weak chatViewModel] in
             Task { @MainActor in
                 guard let self else {
                     return
                 }
 
-                for controller in self.petWindowControllers.values {
-                    await controller.handleAnimationTrigger(.custom("celebrate"))
+                // 解析最后一条助手消息中的 [ACTION:...] 标签，触发动画并清理可见文本
+                    var firedAnyAction = self.chatPathSomersaultFired || self.chatPathToolActionFired
+                if let chatViewModel,
+                   let last = chatViewModel.currentMessages.last,
+                   last.role == .assistant {
+                    let (cleanText, actions) = Self.parseActionTags(from: last.content)
+
+                    for action in actions {
+                        if action.name == "somersault" && self.chatPathSomersaultFired {
+                            continue
+                        }
+                        for controller in self.petWindowControllers.values {
+                            controller.executeAIAction(action.name, count: action.count)
+                        }
+                        firedAnyAction = true
+                    }
+
+                    if cleanText != last.content {
+                        chatViewModel.replaceLastAssistantContent(cleanText)
+                    }
+                }
+
+                // 兜底庆祝动画：只在没有任何具体动作被触发时才放，否则会盖掉刚开始的动作（比如翻跟头）
+                if !firedAnyAction {
+                    for controller in self.petWindowControllers.values {
+                        await controller.handleAnimationTrigger(.custom("celebrate"))
+                    }
+                }
+
+                self.chatPathSomersaultFired = false
+                self.chatPathToolActionFired = false
+                self.conversationTurnCount += 1
+                if self.conversationTurnCount % Self.memoryExtractionEveryNTurns == 0 {
+                    Task { await self.runMemoryExtractionCycle() }
                 }
             }
         }
@@ -146,6 +251,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task {
                 await self.ollamaService?.switchSession(conversationId)
             }
+        }
+        chatViewModel.onSlashCommand = { [weak self, weak chatViewModel] name, arguments in
+            guard let self else { return false }
+            return await self.handleChatSlashCommand(
+                name: name,
+                arguments: arguments,
+                chatViewModel: chatViewModel
+            )
         }
         chatViewModel.onCreateGroup = { [weak self] _, _ in
             guard let self, let databaseManager = self.databaseManager else {
@@ -167,23 +280,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
-        let onSaveAIConfig: @MainActor (String, String, String) -> Void = { [weak self, weak configManager] endpoint, model, aiSystemPrompt in
+        let onSaveAIConfig: @MainActor (String, String, String, AIBackend, String, String) -> Void = { [weak self, weak configManager] endpoint, model, aiSystemPrompt, backend, openAIApiKey, mcpServersJSON in
             guard let self,
                   let configManager else {
                 return
             }
 
-            let trimmedEndpoint = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-            let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedPrompt = aiSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            let resolvedEndpointValue = trimmedEndpoint.isEmpty ? "http://localhost:11434" : trimmedEndpoint
-            let resolvedModel = trimmedModel.isEmpty ? "llama3.2" : trimmedModel
+            let trimmedOpenAIKey = openAIApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedMCPServersJSON = Self.normalizedMCPServersJSON(mcpServersJSON)
+            let resolvedMCPServers = Self.decodedMCPServers(from: normalizedMCPServersJSON)
+            let resolvedEndpointValue = Self.normalizedAIEndpoint(endpoint)
+            let currentBackend = Self.inferredAIBackend(
+                preferred: Self.resolvedAIBackend(from: configManager.config.aiBackend),
+                endpointValue: configManager.config.ollamaEndpoint
+            )
+            let effectiveBackend = Self.inferredAIBackend(preferred: backend, endpointValue: resolvedEndpointValue)
+            let resolvedModel = Self.normalizedAIModel(
+                model,
+                backend: effectiveBackend,
+                previousBackend: currentBackend
+            )
             let resolvedEndpoint = URL(string: resolvedEndpointValue) ?? URL(string: "http://localhost:11434")!
 
             do {
                 try configManager.update {
                     $0.ollamaEndpoint = resolvedEndpointValue
+                    $0.aiBackend = effectiveBackend.rawValue
                     $0.ollamaModel = resolvedModel
+                    $0.openAIApiKey = trimmedOpenAIKey
+                    $0.mcpServersJSON = normalizedMCPServersJSON
                     $0.aiSystemPrompt = trimmedPrompt
                 }
             } catch {
@@ -191,11 +317,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             Task {
-                await ollamaService.updateConfig(endpoint: resolvedEndpoint, model: resolvedModel)
+                await ollamaService.updateConfig(
+                    endpoint: resolvedEndpoint,
+                    model: resolvedModel,
+                    backend: effectiveBackend,
+                    openAIApiKey: trimmedOpenAIKey,
+                    mcpServers: resolvedMCPServers
+                )
                 await ollamaService.updateSystemPrompt(trimmedPrompt)
                 await ollamaService.checkConnection()
                 self.aiStatus = await ollamaService.status
                 chatViewModel.refreshStatus()
+            }
+        }
+        let onSaveAIMemoryConfig: @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = {
+            [weak self, weak configManager] enabled, endpoint, authMode, username, secret, scope, subject, queryLimit in
+            guard let self,
+                  let configManager else {
+                return
+            }
+
+            let resolvedEndpoint = Self.normalizedMemoryWorkerEndpoint(endpoint)
+            let resolvedAuthMode = Self.resolvedMemoryWorkerAuthMode(from: authMode)
+            let trimmedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedSecret = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedScope = Self.normalizedMemoryWorkerScope(scope)
+            let resolvedSubject = Self.normalizedMemoryWorkerSubject(subject)
+            let resolvedQueryLimit = Self.normalizedMemoryWorkerQueryLimit(queryLimit)
+
+            do {
+                try configManager.update {
+                    $0.memoryWorkerEnabled = enabled
+                    $0.memoryWorkerEndpoint = resolvedEndpoint
+                    $0.memoryWorkerAuthMode = resolvedAuthMode.rawValue
+                    $0.memoryWorkerUsername = trimmedUsername
+                    $0.memoryWorkerSecret = trimmedSecret
+                    $0.memoryWorkerScope = resolvedScope
+                    $0.memoryWorkerSubject = resolvedSubject
+                    $0.memoryWorkerQueryLimit = resolvedQueryLimit
+                }
+            } catch {
+                AppLogger.error("Failed to save memory worker config: \(error.localizedDescription)")
+                return
+            }
+
+            let memoryConfig = Self.memoryWorkerConfig(from: configManager.config)
+            if memoryConfig.enabled {
+                if let service = self.memoryWorkerService {
+                    Task {
+                        await service.updateConfig(memoryConfig)
+                        await self.pushUnsyncedMemoriesToRemote()
+                    }
+                } else {
+                    self.memoryWorkerService = MemoryWorkerService(config: memoryConfig)
+                    Task {
+                        await self.pushUnsyncedMemoriesToRemote()
+                    }
+                }
+            } else {
+                self.memoryWorkerService = nil
             }
         }
         let onTestConnection: @MainActor () -> Void = { [weak self] in
@@ -203,6 +383,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await ollamaService.checkConnection()
                 chatViewModel.refreshStatus()
                 self?.aiStatus = await ollamaService.status
+            }
+        }
+        let onTestAIMemoryConnection: @MainActor () async -> String? = { [weak configManager] in
+            guard let configManager else {
+                return "配置管理器未初始化"
+            }
+
+            let resolvedConfig = Self.memoryWorkerConfig(from: configManager.config)
+            let testConfig = MemoryWorkerConfig(
+                enabled: true,
+                endpoint: resolvedConfig.endpoint,
+                authMode: resolvedConfig.authMode,
+                username: resolvedConfig.username,
+                secret: resolvedConfig.secret,
+                namespace: resolvedConfig.namespace,
+                scope: resolvedConfig.scope,
+                subject: resolvedConfig.subject,
+                queryLimit: resolvedConfig.queryLimit,
+                createHorizon: resolvedConfig.createHorizon
+            )
+
+            let service = MemoryWorkerService(config: testConfig)
+
+            do {
+                _ = try await service.queryMemories(q: "connection test")
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
+        }
+        let onTestAIMemoryWrite: @MainActor () async -> String? = { [weak configManager] in
+            guard let configManager else {
+                return "配置管理器未初始化"
+            }
+            let resolvedConfig = Self.memoryWorkerConfig(from: configManager.config)
+            guard resolvedConfig.enabled else {
+                return "请先启用「远程记忆服务」"
+            }
+            let testConfig = MemoryWorkerConfig(
+                enabled: true,
+                endpoint: resolvedConfig.endpoint,
+                authMode: resolvedConfig.authMode,
+                username: resolvedConfig.username,
+                secret: resolvedConfig.secret,
+                namespace: resolvedConfig.namespace,
+                scope: resolvedConfig.scope,
+                subject: resolvedConfig.subject,
+                queryLimit: resolvedConfig.queryLimit,
+                createHorizon: resolvedConfig.createHorizon
+            )
+            let service = MemoryWorkerService(config: testConfig)
+            let token = String(UUID().uuidString.prefix(8))
+            do {
+                _ = try await service.createMemory(
+                    content: "VitaPet 写入自检 \(token)",
+                    category: "fact",
+                    importance: 1,
+                    tags: ["vitapet-self-test", token]
+                )
+                return nil
+            } catch {
+                return error.localizedDescription
             }
         }
         let onSaveNotificationConfig: @MainActor (String, Bool, Int, String) -> Void = { [weak configManager] token, enabled, port, secret in
@@ -228,6 +470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             try await databaseManager.initialize()
+            try await databaseManager.migrateMemoryHashesToStableFingerprintIfNeeded()
         } catch {
             AppLogger.error("Failed to initialize database: \(error.localizedDescription)")
         }
@@ -245,14 +488,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
-        do {
-            let memories = try await databaseManager.fetchMemories(limit: 20)
-            await ollamaService.updateMemories(memories.map(\.content))
-        } catch {
-            AppLogger.error("Failed to load AI memories: \(error.localizedDescription)")
-        }
-
         self.databaseManager = databaseManager
+        await syncFromRemoteMemories(databaseManager: databaseManager)
+        await pushUnsyncedMemoriesToRemote()
+        await refreshMemoryContext()
+        startMemoryRemoteSyncTaskIfNeeded()
         Task {
             try? await databaseManager.pruneOldEvents(keepDays: 30)
         }
@@ -469,11 +709,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             aiEndpoint: { [weak configManager] in
                 configManager?.config.ollamaEndpoint ?? "http://localhost:11434"
             },
+            aiBackend: { [weak configManager] in
+                let endpoint = configManager?.config.ollamaEndpoint ?? ""
+                let preferred = Self.resolvedAIBackend(from: configManager?.config.aiBackend ?? "ollama")
+                return Self.inferredAIBackend(preferred: preferred, endpointValue: endpoint)
+            },
             aiModel: { [weak configManager] in
                 configManager?.config.ollamaModel ?? "llama3.2"
             },
+            openAIApiKey: { [weak configManager] in
+                configManager?.config.openAIApiKey ?? ""
+            },
+            mcpServersJSON: { [weak configManager] in
+                configManager?.config.mcpServersJSON ?? ""
+            },
             aiSystemPrompt: { [weak configManager] in
                 configManager?.config.aiSystemPrompt ?? ""
+            },
+            memoryWorkerEnabled: { [weak configManager] in
+                configManager?.config.memoryWorkerEnabled ?? false
+            },
+            memoryWorkerEndpoint: { [weak configManager] in
+                configManager?.config.memoryWorkerEndpoint ?? "https://memory.example.com"
+            },
+            memoryWorkerAuthMode: { [weak configManager] in
+                let rawValue = configManager?.config.memoryWorkerAuthMode ?? "basic"
+                return Self.resolvedMemoryWorkerAuthMode(from: rawValue).rawValue
+            },
+            memoryWorkerUsername: { [weak configManager] in
+                configManager?.config.memoryWorkerUsername ?? ""
+            },
+            memoryWorkerSecret: { [weak configManager] in
+                configManager?.config.memoryWorkerSecret ?? ""
+            },
+            memoryWorkerScope: { [weak configManager] in
+                configManager?.config.memoryWorkerScope ?? "user"
+            },
+            memoryWorkerSubject: { [weak configManager] in
+                configManager?.config.memoryWorkerSubject ?? "demo-user"
+            },
+            memoryWorkerQueryLimit: { [weak configManager] in
+                configManager?.config.memoryWorkerQueryLimit ?? 5
             },
             aiStatus: { [weak self] in
                 Self.chatUIStatus(from: self?.aiStatus ?? .notConfigured)
@@ -482,7 +758,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 onTestConnection()
                 self?.aiStatus = .connecting
             },
-            onSaveAIConfig: onSaveAIConfig
+            onTestAIMemoryConnection: onTestAIMemoryConnection,
+            onTestAIMemoryWrite: onTestAIMemoryWrite,
+            onSaveAIConfig: onSaveAIConfig,
+            onSaveAIMemoryConfig: onSaveAIMemoryConfig
         )
         chatController.configureNotificationSettings(
             githubToken: { [weak configManager] in
@@ -919,79 +1198,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let currentParticipants = Set(chatViewModel.currentParticipantIds)
             let effectiveTargetPetIDs = currentParticipants.isEmpty ? targetPetIDs : currentParticipants
 
-            let behaviorActions = self.primaryPetController?.debugListBehaviors() ?? []
-            let animActions = AnimationState.allCases.filter { $0 != .idle && $0 != .drag }.map(\.rawValue)
-            let uniqueActions = Array(Set(behaviorActions + animActions)).sorted()
-            let tool = OllamaTool.petActionTool(availableActions: uniqueActions)
-
-            // Update system prompt with current available actions
-            Task { await ollamaService.updateAvailableActions(uniqueActions) }
+            // 用户输入快路径：识别「翻N个跟头/跟斗/筋斗」直接触发，不依赖模型工具调用
+            let userSomersaultCount = Self.parseSomersaultCount(from: text)
 
             Task { @MainActor in
-                if let selectedConversationId = chatViewModel.selectedConversationId {
-                    await ollamaService.switchSession(selectedConversationId)
-                } else if let fallbackConversationId = self.fallbackConversationId(for: effectiveTargetPetIDs) {
+                if chatViewModel.selectedConversationId == nil,
+                   let fallbackConversationId = self.fallbackConversationId(for: effectiveTargetPetIDs) {
                     chatViewModel.selectConversation(fallbackConversationId)
-                    await ollamaService.switchSession(fallbackConversationId)
                 }
 
                 for (id, controller) in self.petWindowControllers where effectiveTargetPetIDs.contains(id) {
                     await controller.handleAnimationTrigger(.userInteract)
-                    controller.showThinkingBubble()
+                    if let count = userSomersaultCount {
+                        controller.executeAIAction("somersault", count: count)
+                    } else {
+                        controller.showThinkingBubble()
+                    }
                 }
                 chatViewModel.addExternalMessage(text)
             }
 
             Task {
                 do {
-                    let systemPrompt = self.configManager.config.aiSystemPrompt
-                    await ollamaService.updateSystemPrompt(systemPrompt)
-                    let targetPets = self.configManager.config.pets.filter { effectiveTargetPetIDs.contains($0.id) }
-                    let isGroupChat = effectiveTargetPetIDs.count > 1
                     let sessionId = await MainActor.run {
                         if let selectedConversationId = chatViewModel.selectedConversationId {
                             return selectedConversationId
                         }
                         return self.fallbackConversationId(for: effectiveTargetPetIDs) ?? "default"
                     }
-                    await ollamaService.switchSession(sessionId)
-
-                    if isGroupChat {
-                        let petInfos = targetPets.map {
-                            PetProfileInfo(
-                                id: $0.id,
-                                name: $0.name,
-                                gender: $0.gender,
-                                age: $0.age,
-                                personality: $0.personality,
-                                hobbies: $0.hobbies
-                            )
-                        }
-                        let groupProfile = await ollamaService.buildGroupChatProfile(pets: petInfos)
-                        await ollamaService.updatePetProfile(groupProfile)
-                    } else if let firstTarget = targetPets.first {
-                        let profile = self.buildPetProfileDescription(for: firstTarget)
-                        await ollamaService.updatePetProfile(profile)
-                    }
-
-                    let stream = try await ollamaService.sendWithTools(
-                        message: text,
-                        tools: [tool],
-                        onToolCall: { [weak self] toolCall in
-                            guard let self else {
-                                return
-                            }
-
-                            if toolCall.functionName == "pet_action",
-                               let action = toolCall.arguments["action"] {
-                                await MainActor.run {
-                                    for (id, controller) in self.petWindowControllers where effectiveTargetPetIDs.contains(id) {
-                                        controller.executeAIAction(action)
-                                    }
-                                }
-                            }
-                        }
+                    let preparedRequest = try await self.prepareConversationRequest(
+                        text: text,
+                        targetPetIDs: effectiveTargetPetIDs,
+                        sessionId: sessionId,
+                        userSomersaultCount: userSomersaultCount,
+                        markChatToolActions: false
                     )
+                    let stream = preparedRequest.stream
+                    let targetPets = preparedRequest.targetPets
+                    let isGroupChat = preparedRequest.isGroupChat
 
                     var fullResponse = ""
                     for try await chunk in stream {
@@ -1009,12 +1253,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             let (cleanText, actions) = Self.parseActionTags(from: fullResponse)
 
                             for action in actions {
+                                if action.name == "somersault" && userSomersaultCount != nil {
+                                    continue
+                                }
                                 for (id, controller) in self.petWindowControllers where effectiveTargetPetIDs.contains(id) {
-                                    controller.executeAIAction(action)
+                                    controller.executeAIAction(action.name, count: action.count)
                                 }
                             }
 
-                            let displayText = cleanText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            let displayText = ThinkingStripper.strip(cleanText)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
                             if !displayText.isEmpty {
                                 if isGroupChat {
                                     let petResponses = Self.parsePetResponses(from: displayText)
@@ -1023,15 +1271,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                         for (id, controller) in self.petWindowControllers where effectiveTargetPetIDs.contains(id) {
                                             controller.showAIBubble(displayText)
                                         }
-                                        chatViewModel.addAssistantMessage(displayText)
+                                        chatViewModel.addAssistantMessage(displayText, displayThinking: false)
                                     } else {
                                         for (petName, message) in petResponses {
+                                            let strippedMessage = ThinkingStripper.strip(message)
+                                                .trimmingCharacters(in: .whitespacesAndNewlines)
                                             let pet = targetPets.first(where: { $0.name == petName })
                                             if let pet,
                                                let controller = self.petWindowControllers[pet.id] {
-                                                controller.showAIBubble(message)
+                                                controller.showAIBubble(strippedMessage)
                                             }
-                                            chatViewModel.addAssistantMessage(message, petId: pet?.id, petName: petName)
+                                            chatViewModel.addAssistantMessage(
+                                                strippedMessage,
+                                                petId: pet?.id,
+                                                petName: petName,
+                                                displayThinking: false
+                                            )
                                         }
                                     }
                                 } else {
@@ -1042,7 +1297,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                     chatViewModel.addAssistantMessage(
                                         displayText,
                                         petId: targetPet?.id,
-                                        petName: targetPet?.name
+                                        petName: targetPet?.name,
+                                        displayThinking: false
                                     )
                                 }
 
@@ -1060,21 +1316,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
 
                     self.conversationTurnCount += 1
-                    if self.conversationTurnCount % 5 == 0 {
+                    if self.conversationTurnCount % Self.memoryExtractionEveryNTurns == 0 {
                         Task {
-                            do {
-                                let recentTurns = try await databaseManager.fetchRecentTurns(limit: 10)
-                                let newMemories = try await ollamaService.extractMemories(
-                                    from: recentTurns.map { (role: $0.role, content: $0.content) }
-                                )
-                                for memory in newMemories {
-                                    try? await databaseManager.insertMemory(content: memory, category: "auto")
-                                }
-                                let allMemories = try await databaseManager.fetchMemories(limit: 20)
-                                await ollamaService.updateMemories(allMemories.map(\.content))
-                            } catch {
-                                AppLogger.error("Failed to extract memories: \(error.localizedDescription)")
-                            }
+                            await self.runMemoryExtractionCycle()
                         }
                     }
                 } catch {
@@ -1312,6 +1556,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         aiProactiveTrigger?.start()
 
         timerSource = TimerSource(interval: 10.0)
+        hourBoundaryTimer = HourBoundaryTimerSource()
         sitReminderTimer = TimerSource(interval: 1800, sourceId: "sit-reminder")
         workspaceMonitor = WorkspaceMonitor()
         notificationMonitor = NotificationMonitor()
@@ -1339,6 +1584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         await timerSource.start(publishingTo: eventBus)
+        await hourBoundaryTimer.start(publishingTo: eventBus)
         await sitReminderTimer.start(publishingTo: eventBus)
         await workspaceMonitor.start(publishingTo: eventBus)
         await notificationMonitor.start(publishingTo: eventBus)
@@ -1716,6 +1962,392 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = await capabilityManager.status(of: .basePet)
     }
 
+    // MARK: - Memory pipeline
+
+    private static func memoryContentHash(_ content: String) -> String {
+        MemoryContentHasher.stableHash(content)
+    }
+
+    /// Full extraction cycle: pulls recent turns, asks LLM to extract structured memories,
+    /// dedups against existing local rows (by content_hash), inserts new ones, pushes to
+    /// remote if configured, and refreshes the LLM context.
+    private func runMemoryExtractionCycle() async {
+        guard let ollamaService = self.ollamaService,
+              let databaseManager = self.databaseManager else {
+            return
+        }
+
+        do {
+            let recentTurns = try await databaseManager.fetchRecentTurns(limit: 20)
+            guard !recentTurns.isEmpty else {
+                AppLogger.info("Memory extraction skipped: no recent turns")
+                await pushUnsyncedMemoriesToRemote()
+                await refreshMemoryContext()
+                return
+            }
+
+            AppLogger.info("Memory extraction starting from \(recentTurns.count) turns")
+            let extracted = try await ollamaService.extractStructuredMemories(
+                from: recentTurns.map { (role: $0.role, content: $0.content) }
+            )
+            AppLogger.info("Memory extraction returned \(extracted.count) candidates")
+            guard !extracted.isEmpty else {
+                await pushUnsyncedMemoriesToRemote()
+                await refreshMemoryContext()
+                return
+            }
+
+            for memory in extracted {
+                let hash = Self.memoryContentHash(memory.content)
+                if (try? await databaseManager.memoryExists(contentHash: hash)) == true {
+                    continue
+                }
+
+                do {
+                    let localId = try await databaseManager.insertMemory(
+                        content: memory.content,
+                        category: memory.category.rawValue,
+                        importance: memory.importance,
+                        source: "auto",
+                        contentHash: hash
+                    )
+
+                    if let memoryWorkerService = self.memoryWorkerService {
+                        do {
+                            let remote = try await memoryWorkerService.createMemory(
+                                content: memory.content,
+                                category: memory.category.rawValue,
+                                importance: memory.importance,
+                                tags: ["auto", memory.category.rawValue]
+                            )
+                            let remoteId = remote.id.map(String.init)
+                            do {
+                                try await databaseManager.markMemorySynced(id: localId, remoteId: remoteId)
+                            } catch {
+                                AppLogger.error(
+                                    "Remote memory created but failed to mark synced locally: \(error.localizedDescription)"
+                                )
+                            }
+                        } catch {
+                            AppLogger.error("Failed to create remote memory: \(error.localizedDescription)")
+                        }
+                    }
+                } catch {
+                    AppLogger.error("Failed to insert memory: \(error.localizedDescription)")
+                }
+            }
+
+            await pushUnsyncedMemoriesToRemote()
+            await refreshMemoryContext()
+        } catch {
+            AppLogger.error("Memory extraction cycle failed: \(error.localizedDescription)")
+            await pushUnsyncedMemoriesToRemote()
+            await refreshMemoryContext()
+        }
+    }
+
+    /// 启动一个后台任务，周期性 flush 未同步记忆。重复调用会先取消旧任务。
+    /// 即便 `memoryWorkerService` 暂时为 nil 也无所谓——`pushUnsyncedMemoriesToRemote` 会直接返回。
+    private func startMemoryRemoteSyncTaskIfNeeded() {
+        memoryRemoteSyncTask?.cancel()
+        memoryRemoteSyncTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: AppDelegate.memoryRemoteFlushInterval)
+                } catch {
+                    return
+                }
+                guard let self else { return }
+                await self.pushUnsyncedMemoriesToRemote()
+            }
+        }
+    }
+
+    /// 当前本地存在、但还没被远端确认的记忆条数。0 表示一切都已同步。
+    func unsyncedMemoryCount() async -> Int {
+        guard let databaseManager = self.databaseManager else { return 0 }
+        return (try? await databaseManager.unsyncedMemoryCount()) ?? 0
+    }
+
+    /// 立即触发一次推送，返回此前未同步的条数（用于在 UI 里给一个明确的反馈）。
+    @discardableResult
+    func flushUnsyncedMemoriesNow() async -> Int {
+        let before = await unsyncedMemoryCount()
+        await pushUnsyncedMemoriesToRemote()
+        return before
+    }
+
+    /// Uploads local rows that never got `synced_at` (e.g. worker was off or the network failed once).
+    private func pushUnsyncedMemoriesToRemote() async {
+        guard let databaseManager = self.databaseManager,
+              let memoryWorkerService = self.memoryWorkerService else {
+            return
+        }
+
+        do {
+            let pending = try await databaseManager.fetchUnsyncedMemoryRecords(limit: 200)
+            guard !pending.isEmpty else { return }
+
+            AppLogger.info("Memory worker: uploading \(pending.count) previously unsynced local memories")
+            for record in pending {
+                do {
+                    var tags = [record.source, record.category].map {
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }.filter { !$0.isEmpty }
+                    if tags.isEmpty {
+                        tags = ["auto"]
+                    }
+                    let remote = try await memoryWorkerService.createMemory(
+                        content: record.content,
+                        category: record.category,
+                        importance: record.importance,
+                        tags: tags
+                    )
+                    try await databaseManager.markMemorySynced(
+                        id: record.id,
+                        remoteId: remote.id.map(String.init)
+                    )
+                } catch {
+                    AppLogger.error(
+                        "Failed to push unsynced memory id=\(record.id): \(error.localizedDescription)"
+                    )
+                }
+            }
+        } catch {
+            AppLogger.error("Failed to read unsynced memories: \(error.localizedDescription)")
+        }
+    }
+
+    /// Recompute and push the memory block to the current AI service.
+    @discardableResult
+    func refreshMemoryContext() async -> [DatabaseManager.MemoryRecord] {
+        guard let databaseManager = self.databaseManager else { return [] }
+
+        let local = (try? await databaseManager.fetchMemoryRecords(limit: 40)) ?? []
+        let items = local.map {
+            MemoryContextItem(
+                content: $0.content,
+                category: MemoryCategory(rawValue: $0.category) ?? .fact,
+                importance: $0.importance
+            )
+        }
+
+        await ollamaService?.updateStructuredMemories(items)
+        return local
+    }
+
+    enum ManualMemoryOutcome {
+        /// 已存入；`storedContent` 是最终落库的文本，`synthesized=true` 表示走了 LLM 合成。
+        case inserted(storedContent: String, category: MemoryCategory, synthesized: Bool)
+        case duplicate
+        case failed
+    }
+
+    /// Record a memory the user explicitly asked to remember (slash command / menu).
+    /// 走一次 LLM 合成：把用户原话改写成第三人称陈述（"用户……"），再入库 + 推远端。
+    /// 合成失败或 LLM 不可用时回退到原话，避免命令完全失败。
+    @discardableResult
+    func recordManualMemory(content: String, category: MemoryCategory = .fact) async -> ManualMemoryOutcome {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let databaseManager = self.databaseManager else { return .failed }
+
+        let synthesized: ExtractedMemory? = await synthesizeManualMemory(rawInput: trimmed)
+        let storedContent = synthesized?.content ?? trimmed
+        let storedCategory = synthesized?.category ?? category
+        // 用户主动 /记住 默认仍按高优先级处理，不让 LLM 把它压到 1。
+        let storedImportance = max(3, synthesized?.importance ?? 3)
+        let didSynthesize = synthesized != nil
+
+        let hash = Self.memoryContentHash(storedContent)
+        if (try? await databaseManager.memoryExists(contentHash: hash)) == true {
+            await refreshMemoryContext()
+            return .duplicate
+        }
+
+        do {
+            let localId = try await databaseManager.insertMemory(
+                content: storedContent,
+                category: storedCategory.rawValue,
+                importance: storedImportance,
+                source: "manual",
+                contentHash: hash
+            )
+
+            if let memoryWorkerService = self.memoryWorkerService {
+                do {
+                    let remote = try await memoryWorkerService.createMemory(
+                        content: storedContent,
+                        category: storedCategory.rawValue,
+                        importance: storedImportance,
+                        tags: ["manual", storedCategory.rawValue]
+                    )
+                    try? await databaseManager.markMemorySynced(id: localId, remoteId: remote.id.map(String.init))
+                } catch {
+                    AppLogger.error("Failed to sync manual memory: \(error.localizedDescription)")
+                }
+            }
+
+            await refreshMemoryContext()
+            return .inserted(storedContent: storedContent, category: storedCategory, synthesized: didSynthesize)
+        } catch {
+            AppLogger.error("Failed to save manual memory: \(error.localizedDescription)")
+            return .failed
+        }
+    }
+
+    /// 把单条用户原话送给抽取链条，取第一条返回。失败/为空都返回 nil（调用方用原话兜底）。
+    private func synthesizeManualMemory(rawInput: String) async -> ExtractedMemory? {
+        guard let ollamaService = self.ollamaService else { return nil }
+        do {
+            let extracted = try await ollamaService.extractStructuredMemories(
+                from: [(role: "user", content: rawInput)]
+            )
+            return extracted.first
+        } catch {
+            AppLogger.error("Manual memory synthesis failed, falling back to raw text: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func deleteMemoryRecord(id: Int64) async {
+        guard let databaseManager = self.databaseManager else { return }
+        do {
+            try await databaseManager.deleteMemory(id: id)
+            await refreshMemoryContext()
+        } catch {
+            AppLogger.error("Failed to delete memory: \(error.localizedDescription)")
+        }
+    }
+
+    func loadMemoryRecords(keyword: String? = nil) async -> [DatabaseManager.MemoryRecord] {
+        guard let databaseManager = self.databaseManager else { return [] }
+        let trimmed = keyword?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmed, !trimmed.isEmpty {
+            return (try? await databaseManager.searchMemoryRecords(keyword: trimmed, limit: 100)) ?? []
+        }
+        return (try? await databaseManager.fetchMemoryRecords(limit: 100)) ?? []
+    }
+
+    /// Handles `/command arguments` messages typed in the chat window. Returns true if the
+    /// command was recognised (caller should not forward the message to the AI).
+    @discardableResult
+    func handleChatSlashCommand(
+        name: String,
+        arguments: String,
+        chatViewModel: ChatViewModel?
+    ) async -> Bool {
+        let normalized = name.lowercased()
+        let trimmedArgs = arguments.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch normalized {
+        case "记住", "记下", "remember":
+            if trimmedArgs.isEmpty {
+                chatViewModel?.addAssistantMessage("请在命令后面写要记住的内容，例如：/记住 我生日是 6 月 3 日")
+                return true
+            }
+            switch await recordManualMemory(content: trimmedArgs, category: .fact) {
+            case .inserted(let storedContent, let category, let synthesized):
+                let prefix = synthesized
+                    ? "好的，我记下了 📌（已整理为 \(category.displayName)）"
+                    : "好的，我记下了 📌（AI 不可用，按原话保存）"
+                chatViewModel?.addAssistantMessage("\(prefix)\n→ \(storedContent)")
+            case .duplicate:
+                chatViewModel?.addAssistantMessage("这条我已经记过了")
+            case .failed:
+                chatViewModel?.addAssistantMessage("没存上，去 Console 查看日志看看哪里出错了")
+            }
+            return true
+
+        case "记忆", "memories":
+            let records = await loadMemoryRecords()
+            if records.isEmpty {
+                chatViewModel?.addAssistantMessage("目前还没有存下任何记忆")
+            } else {
+                let unsynced = await unsyncedMemoryCount()
+                let header: String
+                if memoryWorkerService == nil {
+                    header = "当前记忆（远端未配置，全部仅本地）："
+                } else if unsynced == 0 {
+                    header = "当前记忆（☁️ 表示已同步远端，全部已同步）："
+                } else {
+                    header = "当前记忆（☁️ 表示已同步远端，未同步 \(unsynced) 条，可用 /同步 立即推送）："
+                }
+                let lines = records.prefix(10).map { record -> String in
+                    let cat = (MemoryCategory(rawValue: record.category) ?? .fact).displayName
+                    let syncFlag = record.syncedAt != nil ? " ☁️" : ""
+                    return "• [\(cat)] \(record.content)\(syncFlag)"
+                }
+                let suffix = records.count > 10 ? "\n...共 \(records.count) 条" : ""
+                chatViewModel?.addAssistantMessage(header + "\n" + lines.joined(separator: "\n") + suffix)
+            }
+            return true
+
+        case "同步", "sync":
+            guard memoryWorkerService != nil else {
+                chatViewModel?.addAssistantMessage("还没有配置远端 Memory Worker，去 设置 → AI 设置 → 记忆 打开吧")
+                return true
+            }
+            let before = await flushUnsyncedMemoriesNow()
+            let after = await unsyncedMemoryCount()
+            if before == 0 {
+                chatViewModel?.addAssistantMessage("本地没有未同步的记忆 ✅")
+            } else if after == 0 {
+                chatViewModel?.addAssistantMessage("已把 \(before) 条记忆推到远端 ☁️")
+            } else {
+                let pushed = max(0, before - after)
+                chatViewModel?.addAssistantMessage("推送 \(pushed)/\(before) 条；还有 \(after) 条失败，下个周期会自动重试")
+            }
+            return true
+
+        case "提取", "extract":
+            chatViewModel?.addAssistantMessage("正在从最近对话中提取记忆…")
+            let before = await loadMemoryRecords()
+            await runMemoryExtractionCycle()
+            let after = await loadMemoryRecords()
+            let added = after.count - before.count
+            chatViewModel?.addAssistantMessage(added > 0 ? "提取完成，新增 \(added) 条记忆。/记忆 查看" : "提取完成，这段对话里没有抓到值得长期记住的信息")
+            return true
+
+        case "忘记", "forget":
+            chatViewModel?.addAssistantMessage("想删除具体某条记忆，请打开 设置 → AI 设置 → 记忆管理")
+            return true
+
+        default:
+            chatViewModel?.addAssistantMessage("未知命令 /\(name)。可用：/记住 <内容>、/记忆、/提取、/同步、/忘记")
+            return true
+        }
+    }
+
+    /// One-shot pull from the remote worker to hydrate local memories (useful for multi-device
+    /// scenarios). Dedups against local content_hash so repeated pulls don't duplicate rows.
+    private func syncFromRemoteMemories(databaseManager: DatabaseManager) async {
+        guard let memoryWorkerService = self.memoryWorkerService else { return }
+
+        do {
+            let remote = try await memoryWorkerService.queryMemories()
+            for item in remote {
+                let hash = Self.memoryContentHash(item.content)
+                if (try? await databaseManager.memoryExists(contentHash: hash)) == true { continue }
+                do {
+                    let localId = try await databaseManager.insertMemory(
+                        content: item.content,
+                        category: MemoryCategory.fact.rawValue,
+                        importance: 1,
+                        source: "remote",
+                        contentHash: hash
+                    )
+                    if let remoteId = item.id.map(String.init) {
+                        try? await databaseManager.markMemorySynced(id: localId, remoteId: remoteId)
+                    }
+                } catch {
+                    AppLogger.error("Failed to hydrate remote memory: \(error.localizedDescription)")
+                }
+            }
+        } catch {
+            AppLogger.error("Failed to pull remote memories: \(error.localizedDescription)")
+        }
+    }
+
     private var primaryPetController: PetWindowController? {
         configManager?.config.pets.first.flatMap { petWindowControllers[$0.id] }
     }
@@ -1891,11 +2523,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         try FileManager.default.createDirectory(at: pluginsDirectory, withIntermediateDirectories: true)
 
-        // 逐个检查，缺的才安装
         for plugin in Self.builtInDeclarativePlugins {
             let pluginDir = pluginsDirectory.appendingPathComponent(plugin.directoryName, isDirectory: true)
             let manifestPath = pluginDir.appendingPathComponent("plugin.json")
-            if !FileManager.default.fileExists(atPath: manifestPath.path) {
+            var needsWrite = !FileManager.default.fileExists(atPath: manifestPath.path)
+            if !needsWrite,
+               let data = try? Data(contentsOf: manifestPath),
+               let existing = try? JSONDecoder().decode(PluginManifest.self, from: data) {
+                needsWrite = existing.version != plugin.manifest.version
+            } else if !needsWrite {
+                // Exists but malformed — refresh from embedded manifest.
+                needsWrite = true
+            }
+            if needsWrite {
                 try writePluginManifest(plugin.manifest, to: pluginDir)
             }
         }
@@ -2019,6 +2659,181 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             parts.append("爱好：\(pet.hobbies)。")
         }
         return parts.joined(separator: "")
+    }
+
+    private func resolvedConversationTargetPetIDs(for chatViewModel: ChatViewModel) -> Set<UUID> {
+        let participantIDs = Set(chatViewModel.currentParticipantIds)
+        if !participantIDs.isEmpty {
+            return participantIDs
+        }
+        return Set(configManager.config.pets.map(\.id))
+    }
+
+    private func buildConversationActionTool() -> (tool: OllamaTool, availableActions: [String]) {
+        let behaviorActions = primaryPetController?.debugListBehaviors() ?? []
+        let animationActions = AnimationState.allCases
+            .filter { $0 != .idle && $0 != .drag }
+            .map(\.rawValue)
+        let uniqueActions = Array(Set(behaviorActions + animationActions)).sorted()
+        return (OllamaTool.petActionTool(availableActions: uniqueActions), uniqueActions)
+    }
+
+    private func prepareConversationRequest(
+        text: String,
+        targetPetIDs: Set<UUID>,
+        sessionId: String,
+        userSomersaultCount: Int?,
+        markChatToolActions: Bool
+    ) async throws -> PreparedConversationRequest {
+        guard let ollamaService else {
+            throw OllamaServiceError.serviceUnavailable
+        }
+
+        let (tool, uniqueActions) = buildConversationActionTool()
+        await ollamaService.updateAvailableActions(uniqueActions)
+
+        let systemPrompt = configManager.config.aiSystemPrompt
+        await ollamaService.updateSystemPrompt(systemPrompt)
+        await refreshMemoryContext()
+
+        let targetPets = configManager.config.pets.filter { targetPetIDs.contains($0.id) }
+        let isGroupChat = targetPets.count > 1
+        await ollamaService.switchSession(sessionId)
+
+        if isGroupChat {
+            let petInfos = targetPets.map {
+                PetProfileInfo(
+                    id: $0.id,
+                    name: $0.name,
+                    gender: $0.gender,
+                    age: $0.age,
+                    personality: $0.personality,
+                    hobbies: $0.hobbies
+                )
+            }
+            let groupProfile = await ollamaService.buildGroupChatProfile(pets: petInfos)
+            await ollamaService.updatePetProfile(groupProfile)
+        } else if let firstTarget = targetPets.first {
+            let profile = buildPetProfileDescription(for: firstTarget)
+            await ollamaService.updatePetProfile(profile)
+        } else {
+            await ollamaService.updatePetProfile("")
+        }
+
+        let stream = try await ollamaService.sendWithTools(
+            message: text,
+            tools: [tool],
+            onToolCall: { [weak self] toolCall in
+                guard let self else {
+                    return nil
+                }
+                return await self.handleLocalConversationToolCall(
+                    toolCall,
+                    targetPetIDs: targetPetIDs,
+                    userSomersaultCount: userSomersaultCount,
+                    markChatToolActions: markChatToolActions
+                )
+            }
+        )
+
+        return PreparedConversationRequest(stream: stream, targetPets: targetPets, isGroupChat: isGroupChat)
+    }
+
+    private func handleLocalConversationToolCall(
+        _ toolCall: PetToolCall,
+        targetPetIDs: Set<UUID>,
+        userSomersaultCount: Int?,
+        markChatToolActions: Bool
+    ) async -> String? {
+        guard toolCall.functionName == "pet_action",
+              let action = toolCall.arguments["action"]?.stringValue else {
+            return nil
+        }
+
+        if action == "somersault", let userSomersaultCount {
+            let payload = JSONValue.object([
+                "status": .string("ok"),
+                "tool": .string(toolCall.functionName),
+                "action": .string(action),
+                "count": .number(Double(userSomersaultCount)),
+                "source": .string("user_fast_path")
+            ])
+            return payload.compactJSONString()
+        }
+
+        let count = max(1, min(toolCall.arguments["count"]?.intValue ?? 1, 8))
+        for (id, controller) in petWindowControllers where targetPetIDs.contains(id) {
+            controller.executeAIAction(action, count: count)
+        }
+        if markChatToolActions {
+            chatPathToolActionFired = true
+        }
+
+        let payload = JSONValue.object([
+            "status": .string("ok"),
+            "tool": .string(toolCall.functionName),
+            "action": .string(action),
+            "count": .number(Double(count))
+        ])
+        return payload.compactJSONString()
+    }
+
+    private func installMainMenuIfNeeded() {
+        guard NSApp.mainMenu == nil else {
+            return
+        }
+
+        let mainMenu = NSMenu(title: "MainMenu")
+
+        // App menu
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu(title: "VitaPet")
+        appMenuItem.submenu = appMenu
+
+        let quitItem = NSMenuItem(
+            title: L10n.menuQuit,
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quitItem.keyEquivalentModifierMask = [.command]
+        appMenu.addItem(quitItem)
+
+        // Edit menu
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenuItem.submenu = editMenu
+
+        let undoItem = NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        undoItem.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(undoItem)
+
+        let redoItem = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redoItem)
+
+        editMenu.addItem(.separator())
+
+        let cutItem = NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        cutItem.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(cutItem)
+
+        let copyItem = NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        copyItem.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(copyItem)
+
+        let pasteItem = NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        pasteItem.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(pasteItem)
+
+        editMenu.addItem(.separator())
+
+        let selectAllItem = NSMenuItem(title: "Select All", action: #selector(NSResponder.selectAll(_:)), keyEquivalent: "a")
+        selectAllItem.keyEquivalentModifierMask = [.command]
+        editMenu.addItem(selectAllItem)
+
+        NSApp.mainMenu = mainMenu
     }
 
     nonisolated private static func chatUIStatus(from status: AIEngine.AIEngineStatus) -> ChatUI.AIEngineStatus {
@@ -2192,8 +3007,8 @@ extension AppDelegate {
             PluginManifest(
                 id: "com.vitapet.sit-reminder",
                 name: "久坐提醒",
-                version: "1.0",
-                description: "每45分钟提醒你站起来活动",
+                version: "1.0.1",
+                description: "每30分钟提醒你站起来活动",
                 capabilities: [],
                 triggers: [
                     TriggerRule(
@@ -2234,13 +3049,13 @@ extension AppDelegate {
             PluginManifest(
                 id: "com.vitapet.hourly-chime",
                 name: "整点报时",
-                version: "1.0",
+                version: "1.0.1",
                 description: "每小时报时",
                 capabilities: [],
                 triggers: [
                     TriggerRule(
                         event: "timerFired",
-                        conditions: [:],
+                        conditions: ["id": "hour-boundary"],
                         actions: [
                             PluginAction(type: "animation", state: "alert"),
                             PluginAction(type: "bubble", message: "现在是 {hour} 点~⏰")
@@ -2387,20 +3202,74 @@ extension AppDelegate {
         return results
     }
 
-    /// Parse [ACTION:xxx] tags from AI response text.
-    /// Returns cleaned text (tags removed) and list of action names.
-    static func parseActionTags(from text: String) -> (cleanText: String, actions: [String]) {
-        var actions: [String] = []
-        let pattern = #"\[ACTION:(\w+)\]"#
+    /// 从用户输入中识别「翻 N 个 跟头/跟斗/筋斗/空翻」或英文 somersault/flip 命令。
+    /// 返回次数（1-8 已 clamp），未匹配返回 nil。
+    static func parseSomersaultCount(from text: String) -> Int? {
+        let zhDigits: [Character: Int] = [
+            "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+            "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10
+        ]
+
+        // 中文模式：可选数字 + 可选「个」 + 跟头/跟斗/筋斗/空翻
+        let zhPattern = #"翻\s*(\d+|[一二三四五六七八九十两])?\s*个?\s*(跟头|跟斗|筋斗|空翻)"#
+        if let regex = try? NSRegularExpression(pattern: zhPattern) {
+            let range = NSRange(text.startIndex..., in: text)
+            if let match = regex.firstMatch(in: text, range: range) {
+                let countRange = match.range(at: 1)
+                if countRange.location == NSNotFound {
+                    return 1
+                }
+                if let r = Range(countRange, in: text) {
+                    let raw = String(text[r])
+                    if let n = Int(raw) {
+                        return max(1, min(n, 8))
+                    }
+                    if let c = raw.first, let n = zhDigits[c] {
+                        return max(1, min(n, 8))
+                    }
+                }
+                return 1
+            }
+        }
+
+        // 英文模式：N somersault(s)/flip(s) 或 do a somersault/flip
+        let enPattern = #"(?i)(?:(\d+)\s*)?(?:somersault|backflip|flip)s?"#
+        if let regex = try? NSRegularExpression(pattern: enPattern) {
+            let range = NSRange(text.startIndex..., in: text)
+            if let match = regex.firstMatch(in: text, range: range) {
+                let countRange = match.range(at: 1)
+                if countRange.location != NSNotFound,
+                   let r = Range(countRange, in: text),
+                   let n = Int(text[r]) {
+                    return max(1, min(n, 8))
+                }
+                return 1
+            }
+        }
+
+        return nil
+    }
+
+    /// Parse [ACTION:xxx] or [ACTION:xxx:N] tags from AI response text.
+    /// Returns cleaned text (tags removed) and list of (action name, count) pairs.
+    static func parseActionTags(from text: String) -> (cleanText: String, actions: [(name: String, count: Int)]) {
+        var actions: [(name: String, count: Int)] = []
+        let pattern = #"\[ACTION:(\w+)(?::(\d+))?\]"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else {
             return (text, [])
         }
         let range = NSRange(text.startIndex..., in: text)
         let matches = regex.matches(in: text, range: range)
         for match in matches {
-            if let actionRange = Range(match.range(at: 1), in: text) {
-                actions.append(String(text[actionRange]))
+            guard let actionRange = Range(match.range(at: 1), in: text) else { continue }
+            let name = String(text[actionRange])
+            var count = 1
+            if match.numberOfRanges > 2,
+               let countRange = Range(match.range(at: 2), in: text),
+               let parsed = Int(text[countRange]) {
+                count = max(1, min(parsed, 8))
             }
+            actions.append((name, count))
         }
         let cleanText = regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
         return (cleanText, actions)
@@ -2418,4 +3287,156 @@ private extension JSONEncoder {
 private func requestAccessibilityPermission() {
     let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
     AXIsProcessTrustedWithOptions(options)
+}
+
+private extension AppDelegate {
+    static func resolvedAIBackend(from rawValue: String) -> AIBackend {
+        AIBackend(rawValue: rawValue) ?? .ollama
+    }
+
+    static func inferredAIBackend(preferred: AIBackend, endpointValue: String) -> AIBackend {
+        let lowercased = endpointValue.lowercased()
+        if lowercased.contains("/v1/chat/completions") || lowercased.contains("/v1/models") {
+            return .openAICompatible
+        }
+        if lowercased.contains("/api/chat") || lowercased.contains("/api/tags") {
+            return .ollama
+        }
+        return preferred
+    }
+
+    static func normalizedAIEndpoint(_ rawValue: String, fallback: String = "http://localhost:11434") -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return fallback
+        }
+
+        if trimmed.contains("://") {
+            return trimmed
+        }
+
+        return "http://\(trimmed)"
+    }
+
+    static func normalizedAIModel(_ rawValue: String, backend: AIBackend, previousBackend: AIBackend? = nil) -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return backend.defaultModel
+        }
+
+        if let previousBackend, previousBackend != backend, trimmed == previousBackend.defaultModel {
+            return backend.defaultModel
+        }
+
+        return trimmed
+    }
+
+    static func normalizedMCPServersJSON(_ rawValue: String) -> String {
+        rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func decodedMCPServers(from rawValue: String) -> [MCPServerConfiguration] {
+        do {
+            return try MCPServerConfiguration.decodeList(from: normalizedMCPServersJSON(rawValue))
+        } catch {
+            AppLogger.error("Failed to decode MCP server config: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    static func resolvedMemoryWorkerAuthMode(from rawValue: String) -> MemoryWorkerAuthMode {
+        MemoryWorkerAuthMode(rawValue: rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) ?? .basic
+    }
+
+    static func normalizedMemoryWorkerEndpoint(
+        _ rawValue: String,
+        fallback: String = "https://memory.example.com"
+    ) -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return fallback
+        }
+
+        if trimmed.contains("://") {
+            return trimmed
+        }
+
+        return "https://\(trimmed)"
+    }
+
+    static func normalizedMemoryWorkerScope(_ rawValue: String, fallback: String = "user") -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    static func normalizedMemoryWorkerSubject(_ rawValue: String, fallback: String = "") -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, trimmed != "demo-user" {
+            return trimmed
+        }
+
+        let explicitFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !explicitFallback.isEmpty {
+            return explicitFallback
+        }
+
+        let systemUser = NSUserName().trimmingCharacters(in: .whitespacesAndNewlines)
+        return systemUser.isEmpty ? "default" : systemUser
+    }
+
+    static func normalizedMemoryWorkerQueryLimit(_ rawValue: Int, fallback: Int = 5) -> Int {
+        let resolved = rawValue <= 0 ? fallback : rawValue
+        return max(1, min(100, resolved))
+    }
+
+    static func normalizedMemoryWorkerHorizon(_ rawValue: String, fallback: String = "daily") -> String {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "daily", "weekly", "monthly", "permanent":
+            return normalized
+        default:
+            return fallback
+        }
+    }
+
+    static func memoryWorkerConfig(from config: ConfigManager.AppConfig) -> MemoryWorkerConfig {
+        MemoryWorkerConfig(
+            enabled: config.memoryWorkerEnabled,
+            endpoint: normalizedMemoryWorkerEndpoint(config.memoryWorkerEndpoint),
+            authMode: resolvedMemoryWorkerAuthMode(from: config.memoryWorkerAuthMode),
+            username: config.memoryWorkerUsername.trimmingCharacters(in: .whitespacesAndNewlines),
+            secret: config.memoryWorkerSecret.trimmingCharacters(in: .whitespacesAndNewlines),
+            namespace: config.memoryWorkerNamespace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "default"
+                : config.memoryWorkerNamespace.trimmingCharacters(in: .whitespacesAndNewlines),
+            scope: normalizedMemoryWorkerScope(config.memoryWorkerScope),
+            subject: normalizedMemoryWorkerSubject(config.memoryWorkerSubject),
+            queryLimit: normalizedMemoryWorkerQueryLimit(config.memoryWorkerQueryLimit),
+            createHorizon: normalizedMemoryWorkerHorizon(config.memoryWorkerCreateHorizon)
+        )
+    }
+
+    static func mergeMemories(local: [String], remote: [String], maxCount: Int) -> [String] {
+        var ordered: [String] = []
+        var seen: Set<String> = []
+
+        for memory in remote + local {
+            let trimmed = memory.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                continue
+            }
+
+            let key = trimmed.lowercased()
+            guard seen.insert(key).inserted else {
+                continue
+            }
+
+            ordered.append(trimmed)
+            if ordered.count >= max(1, maxCount) {
+                break
+            }
+        }
+
+        return ordered
+    }
 }

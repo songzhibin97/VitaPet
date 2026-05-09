@@ -166,13 +166,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
             return
         }
 
-        if let image = NSImage(systemSymbolName: "pawprint.fill", accessibilityDescription: "VitaPet") {
-            image.isTemplate = true
-            button.image = image
-        } else {
-            button.title = "🐾"
-        }
-
+        button.image = Self.makeStatusBarImage()
+        button.imageScaling = .scaleProportionallyDown
+        button.imagePosition = .imageOnly
+        button.image?.isTemplate = true
+        button.image?.accessibilityDescription = "VitaPet"
         button.toolTip = tooltip(for: currentMoodLevel())
     }
 
@@ -440,6 +438,109 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         let item = menu.addItem(withTitle: title, action: action, keyEquivalent: keyEquivalent)
         item.target = self
         item.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
+    }
+
+    private static func statusBarIconPointSize() -> CGFloat {
+        let thickness = NSStatusBar.system.thickness
+        return max(18, min(22, thickness - 1))
+    }
+
+    private static func makeStatusBarImage() -> NSImage {
+        let pointSize = statusBarIconPointSize()
+        return makeTemplateCatBubbleIcon(pointSize: pointSize)
+    }
+
+    /// Draw a compact brand mark instead of relying on whichever SF Symbol set
+    /// happens to be available on the host macOS version.
+    private static func makeTemplateCatBubbleIcon(pointSize: CGFloat) -> NSImage {
+        let scale: CGFloat = 8
+        let canvas = pointSize * scale
+        let image = NSImage(size: NSSize(width: canvas, height: canvas), flipped: false) { rect in
+            guard let ctx = NSGraphicsContext.current?.cgContext else {
+                return false
+            }
+            
+            // Ultra-high rendering quality and anti-aliasing for menu bar precision
+            ctx.setShouldAntialias(true)
+            ctx.setAllowsAntialiasing(true)
+            ctx.interpolationQuality = .high
+
+            let inset = canvas * 0.15
+            let glyph = NSRect(
+                x: inset,
+                y: inset,
+                width: canvas - inset * 2,
+                height: canvas - inset * 2
+            )
+            let gw = glyph.width
+            let gh = glyph.height
+            let gx = glyph.minX
+            let gy = glyph.minY
+
+            // Menu bar icons must be solid black paths (rendered as a template)
+            let strokeColor = NSColor.black
+            let strokeWidth = canvas * 0.095
+
+            // ── Cat face: line-art stroke style ───────────────────────
+            let cx  = gx + gw * 0.50
+            let fr  = gw * 0.40
+            let fcy = gy + gh * 0.40
+
+            let head = NSBezierPath()
+            head.lineJoinStyle = .miter
+            head.lineCapStyle  = .round
+            head.lineWidth     = strokeWidth
+
+            head.move(to: NSPoint(x: cx,       y: fcy - fr))
+            head.curve(to: NSPoint(x: cx + fr, y: fcy),
+                       controlPoint1: NSPoint(x: cx + fr * 0.552, y: fcy - fr),
+                       controlPoint2: NSPoint(x: cx + fr,         y: fcy - fr * 0.552))
+            head.curve(to: NSPoint(x: cx + fr * 0.70, y: fcy + fr * 0.70),
+                       controlPoint1: NSPoint(x: cx + fr,          y: fcy + fr * 0.35),
+                       controlPoint2: NSPoint(x: cx + fr * 0.88,   y: fcy + fr * 0.58))
+            head.curve(to: NSPoint(x: cx + fr * 0.22, y: fcy + fr * 0.88),
+                       controlPoint1: NSPoint(x: cx + fr * 0.72, y: fcy + fr * 1.22),
+                       controlPoint2: NSPoint(x: cx + fr * 0.20, y: fcy + fr * 1.22))
+            head.curve(to: NSPoint(x: cx - fr * 0.22, y: fcy + fr * 0.88),
+                       controlPoint1: NSPoint(x: cx + fr * 0.10, y: fcy + fr * 0.72),
+                       controlPoint2: NSPoint(x: cx - fr * 0.10, y: fcy + fr * 0.72))
+            head.curve(to: NSPoint(x: cx - fr * 0.70, y: fcy + fr * 0.70),
+                       controlPoint1: NSPoint(x: cx - fr * 0.20, y: fcy + fr * 1.22),
+                       controlPoint2: NSPoint(x: cx - fr * 0.72, y: fcy + fr * 1.22))
+            head.curve(to: NSPoint(x: cx - fr, y: fcy),
+                       controlPoint1: NSPoint(x: cx - fr * 0.88,   y: fcy + fr * 0.58),
+                       controlPoint2: NSPoint(x: cx - fr,           y: fcy + fr * 0.35))
+            head.curve(to: NSPoint(x: cx,      y: fcy - fr),
+                       controlPoint1: NSPoint(x: cx - fr,           y: fcy - fr * 0.552),
+                       controlPoint2: NSPoint(x: cx - fr * 0.552,   y: fcy - fr))
+            head.close()
+            strokeColor.setStroke()
+            head.stroke()
+
+            let eyeR  = fr * 0.13
+            let eyeY  = fcy + fr * 0.12
+            let eyeOX = fr * 0.38
+            strokeColor.setFill()
+            NSBezierPath(ovalIn: NSRect(x: cx - eyeOX - eyeR, y: eyeY - eyeR,
+                                        width: eyeR * 2, height: eyeR * 2)).fill()
+            NSBezierPath(ovalIn: NSRect(x: cx + eyeOX - eyeR, y: eyeY - eyeR,
+                                        width: eyeR * 2, height: eyeR * 2)).fill()
+
+            let noseY = fcy - fr * 0.10
+            let ns    = fr * 0.10
+            let nose  = NSBezierPath()
+            nose.move(to: NSPoint(x: cx - ns, y: noseY + ns * 0.65))
+            nose.line(to: NSPoint(x: cx + ns, y: noseY + ns * 0.65))
+            nose.line(to: NSPoint(x: cx,      y: noseY - ns * 0.65))
+            nose.close()
+            strokeColor.setFill()
+            nose.fill()
+            
+            return true
+        }
+        image.size = NSSize(width: pointSize, height: pointSize)
+        image.isTemplate = true
+        return image
     }
 
     private func tooltip(for level: PetMood.MoodLevel) -> String {

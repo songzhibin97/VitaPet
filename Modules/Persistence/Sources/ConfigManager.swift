@@ -12,7 +12,12 @@ public final class ConfigManager {
         public var disabledPlugins: [String]
         public var locale: String
         public var ollamaEndpoint: String
+        public var aiBackend: String
         public var ollamaModel: String
+        /// API Key for OpenAI-compatible backends; sent as `Authorization: Bearer`. Empty = no header (e.g. local proxy).
+        public var openAIApiKey: String
+        /// JSON array of stdio MCP server definitions.
+        public var mcpServersJSON: String
         public var aiSystemPrompt: String
         public var aiProactiveEnabled: Bool
         public var aiProactiveInterval: Int
@@ -21,6 +26,16 @@ public final class ConfigManager {
         public var webhookPort: Int
         public var webhookSecret: String
         public var spaceMode: String  // "allSpaces", "follow", "singleSpace"
+        public var memoryWorkerEnabled: Bool
+        public var memoryWorkerEndpoint: String
+        public var memoryWorkerAuthMode: String
+        public var memoryWorkerUsername: String
+        public var memoryWorkerSecret: String
+        public var memoryWorkerNamespace: String
+        public var memoryWorkerScope: String
+        public var memoryWorkerSubject: String
+        public var memoryWorkerQueryLimit: Int
+        public var memoryWorkerCreateHorizon: String
 
         public init(
             windowPositionX: Double,
@@ -32,7 +47,10 @@ public final class ConfigManager {
             disabledPlugins: [String] = [],
             locale: String,
             ollamaEndpoint: String = "http://localhost:11434",
+            aiBackend: String = "ollama",
             ollamaModel: String = "llama3.2",
+            openAIApiKey: String = "",
+            mcpServersJSON: String = "",
             aiSystemPrompt: String = "",
             aiProactiveEnabled: Bool = true,
             aiProactiveInterval: Int = 45,
@@ -40,7 +58,17 @@ public final class ConfigManager {
             webhookEnabled: Bool = false,
             webhookPort: Int = 19280,
             webhookSecret: String = "",
-            spaceMode: String = "allSpaces"
+            spaceMode: String = "allSpaces",
+            memoryWorkerEnabled: Bool = false,
+            memoryWorkerEndpoint: String = "https://memory.example.com",
+            memoryWorkerAuthMode: String = "basic",
+            memoryWorkerUsername: String = "",
+            memoryWorkerSecret: String = "",
+            memoryWorkerNamespace: String = "default",
+            memoryWorkerScope: String = "user",
+            memoryWorkerSubject: String = "demo-user",
+            memoryWorkerQueryLimit: Int = 5,
+            memoryWorkerCreateHorizon: String = "daily"
         ) {
             let resolvedPets = Self.resolvePets(
                 pets,
@@ -60,7 +88,10 @@ public final class ConfigManager {
             self.disabledPlugins = disabledPlugins
             self.locale = locale
             self.ollamaEndpoint = ollamaEndpoint
+            self.aiBackend = aiBackend
             self.ollamaModel = ollamaModel
+            self.openAIApiKey = openAIApiKey
+            self.mcpServersJSON = mcpServersJSON
             self.aiSystemPrompt = aiSystemPrompt
             self.aiProactiveEnabled = aiProactiveEnabled
             self.aiProactiveInterval = aiProactiveInterval
@@ -69,6 +100,16 @@ public final class ConfigManager {
             self.webhookPort = webhookPort
             self.webhookSecret = webhookSecret
             self.spaceMode = spaceMode
+            self.memoryWorkerEnabled = memoryWorkerEnabled
+            self.memoryWorkerEndpoint = memoryWorkerEndpoint
+            self.memoryWorkerAuthMode = memoryWorkerAuthMode
+            self.memoryWorkerUsername = memoryWorkerUsername
+            self.memoryWorkerSecret = memoryWorkerSecret
+            self.memoryWorkerNamespace = memoryWorkerNamespace
+            self.memoryWorkerScope = memoryWorkerScope
+            self.memoryWorkerSubject = memoryWorkerSubject
+            self.memoryWorkerQueryLimit = Self.clampedMemoryQueryLimit(memoryWorkerQueryLimit)
+            self.memoryWorkerCreateHorizon = Self.normalizedMemoryHorizon(memoryWorkerCreateHorizon)
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -81,7 +122,10 @@ public final class ConfigManager {
             case disabledPlugins
             case locale
             case ollamaEndpoint
+            case aiBackend
             case ollamaModel
+            case openAIApiKey
+            case mcpServersJSON
             case aiSystemPrompt
             case aiProactiveEnabled
             case aiProactiveInterval
@@ -90,6 +134,16 @@ public final class ConfigManager {
             case webhookPort
             case webhookSecret
             case spaceMode
+            case memoryWorkerEnabled
+            case memoryWorkerEndpoint
+            case memoryWorkerAuthMode
+            case memoryWorkerUsername
+            case memoryWorkerSecret
+            case memoryWorkerNamespace
+            case memoryWorkerScope
+            case memoryWorkerSubject
+            case memoryWorkerQueryLimit
+            case memoryWorkerCreateHorizon
         }
 
         public init(from decoder: Decoder) throws {
@@ -117,7 +171,10 @@ public final class ConfigManager {
             disabledPlugins = try container.decodeIfPresent([String].self, forKey: .disabledPlugins) ?? []
             locale = try container.decodeIfPresent(String.self, forKey: .locale) ?? ConfigManager.defaultLocaleIdentifier()
             ollamaEndpoint = try container.decodeIfPresent(String.self, forKey: .ollamaEndpoint) ?? "http://localhost:11434"
+            aiBackend = try container.decodeIfPresent(String.self, forKey: .aiBackend) ?? "ollama"
             ollamaModel = try container.decodeIfPresent(String.self, forKey: .ollamaModel) ?? "llama3.2"
+            openAIApiKey = try container.decodeIfPresent(String.self, forKey: .openAIApiKey) ?? ""
+            mcpServersJSON = try container.decodeIfPresent(String.self, forKey: .mcpServersJSON) ?? ""
             aiSystemPrompt = try container.decodeIfPresent(String.self, forKey: .aiSystemPrompt) ?? ""
             aiProactiveEnabled = try container.decodeIfPresent(Bool.self, forKey: .aiProactiveEnabled) ?? true
             aiProactiveInterval = try container.decodeIfPresent(Int.self, forKey: .aiProactiveInterval) ?? 45
@@ -126,6 +183,20 @@ public final class ConfigManager {
             webhookPort = try container.decodeIfPresent(Int.self, forKey: .webhookPort) ?? 19280
             webhookSecret = try container.decodeIfPresent(String.self, forKey: .webhookSecret) ?? ""
             spaceMode = try container.decodeIfPresent(String.self, forKey: .spaceMode) ?? "allSpaces"
+            memoryWorkerEnabled = try container.decodeIfPresent(Bool.self, forKey: .memoryWorkerEnabled) ?? false
+            memoryWorkerEndpoint = try container.decodeIfPresent(String.self, forKey: .memoryWorkerEndpoint) ?? "https://memory.example.com"
+            memoryWorkerAuthMode = try container.decodeIfPresent(String.self, forKey: .memoryWorkerAuthMode) ?? "basic"
+            memoryWorkerUsername = try container.decodeIfPresent(String.self, forKey: .memoryWorkerUsername) ?? ""
+            memoryWorkerSecret = try container.decodeIfPresent(String.self, forKey: .memoryWorkerSecret) ?? ""
+            memoryWorkerNamespace = try container.decodeIfPresent(String.self, forKey: .memoryWorkerNamespace) ?? "default"
+            memoryWorkerScope = try container.decodeIfPresent(String.self, forKey: .memoryWorkerScope) ?? "user"
+            memoryWorkerSubject = try container.decodeIfPresent(String.self, forKey: .memoryWorkerSubject) ?? "demo-user"
+            memoryWorkerQueryLimit = Self.clampedMemoryQueryLimit(
+                try container.decodeIfPresent(Int.self, forKey: .memoryWorkerQueryLimit) ?? 5
+            )
+            memoryWorkerCreateHorizon = Self.normalizedMemoryHorizon(
+                try container.decodeIfPresent(String.self, forKey: .memoryWorkerCreateHorizon) ?? "daily"
+            )
         }
 
         mutating func synchronizeLegacyFields() {
@@ -185,6 +256,20 @@ public final class ConfigManager {
                     positionY: legacyWindowPositionY
                 )
             ]
+        }
+
+        private static func clampedMemoryQueryLimit(_ value: Int) -> Int {
+            max(1, min(100, value))
+        }
+
+        private static func normalizedMemoryHorizon(_ value: String) -> String {
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            switch normalized {
+            case "daily", "weekly", "monthly", "permanent":
+                return normalized
+            default:
+                return "daily"
+            }
         }
     }
 

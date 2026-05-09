@@ -1,14 +1,157 @@
 import Foundation
 import Localization
 
+public enum MemoryCategory: String, Sendable, CaseIterable, Codable {
+    case fact
+    case preference
+    case event
+    case todo
+    case relationship
+
+    public var displayName: String {
+        switch self {
+        case .fact: return "事实"
+        case .preference: return "偏好"
+        case .event: return "事件"
+        case .todo: return "待办"
+        case .relationship: return "关系"
+        }
+    }
+
+    public static func from(rawValue: String?) -> MemoryCategory {
+        guard let raw = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              let category = MemoryCategory(rawValue: raw) else {
+            return .fact
+        }
+        return category
+    }
+}
+
+public struct ExtractedMemory: Sendable, Equatable {
+    public let content: String
+    public let category: MemoryCategory
+    public let importance: Int
+
+    public init(content: String, category: MemoryCategory, importance: Int) {
+        self.content = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.category = category
+        self.importance = max(1, min(3, importance))
+    }
+
+    init?(fromDict dict: [String: Any]) {
+        guard let rawContent = dict["content"] as? String else { return nil }
+        let trimmed = rawContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let category = MemoryCategory.from(rawValue: dict["category"] as? String)
+        let importance: Int
+        if let int = dict["importance"] as? Int {
+            importance = int
+        } else if let double = dict["importance"] as? Double {
+            importance = Int(double)
+        } else if let string = dict["importance"] as? String, let parsed = Int(string) {
+            importance = parsed
+        } else {
+            importance = 1
+        }
+
+        self.init(content: trimmed, category: category, importance: importance)
+    }
+}
+
+public struct MemoryContextItem: Sendable, Equatable {
+    public let content: String
+    public let category: MemoryCategory
+    public let importance: Int
+
+    public init(content: String, category: MemoryCategory, importance: Int) {
+        self.content = content
+        self.category = category
+        self.importance = importance
+    }
+}
+
+/// Strips reasoning/thinking content emitted by chain-of-thought models
+/// (DeepSeek-R1, QwQ, etc.) before it reaches the UI or persisted history.
+///
+/// Handles three patterns:
+/// 1. Well-formed: `<think>...</think>实际回复` — block removed.
+/// 2. Tagless leak: `推理过程...</think>实际回复` — model forgot the opener
+///    but emitted a closer; treat everything before the last close tag as
+///    reasoning and drop it.
+/// 3. Unclosed: `<think>...` (close never arrived) — drop the trailing block.
+public enum ThinkingStripper {
+    private static let openTags = ["<think>", "<thinking>", "<reasoning>", "<reflection>"]
+    private static let closeTags = ["</think>", "</thinking>", "</reasoning>", "</reflection>"]
+
+    public static func strip(_ text: String) -> String {
+        split(text).reply
+    }
+
+    /// Separate reasoning from reply. Handles well-formed `<think>...</think>`,
+    /// tagless leak (close tag with no opener), and unclosed open tag.
+    public static func split(_ text: String) -> (thinking: String?, reply: String) {
+        guard !text.isEmpty else { return (nil, text) }
+        var thinkingChunks: [String] = []
+        var result = text
+
+        for (open, close) in zip(openTags, closeTags) {
+            while let openRange = result.range(of: open, options: .caseInsensitive) {
+                let searchRange = openRange.upperBound..<result.endIndex
+                guard let closeRange = result.range(of: close, options: .caseInsensitive, range: searchRange) else {
+                    break
+                }
+                let inner = String(result[openRange.upperBound..<closeRange.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !inner.isEmpty { thinkingChunks.append(inner) }
+                result.removeSubrange(openRange.lowerBound..<closeRange.upperBound)
+            }
+        }
+
+        for close in closeTags {
+            if let range = result.range(of: close, options: [.caseInsensitive, .backwards]) {
+                let leak = String(result[result.startIndex..<range.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !leak.isEmpty { thinkingChunks.insert(leak, at: 0) }
+                result.removeSubrange(result.startIndex..<range.upperBound)
+            }
+        }
+
+        for open in openTags {
+            if let range = result.range(of: open, options: .caseInsensitive) {
+                let trailing = String(result[range.upperBound..<result.endIndex])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trailing.isEmpty { thinkingChunks.append(trailing) }
+                result.removeSubrange(range.lowerBound..<result.endIndex)
+            }
+        }
+
+        let reply = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        let thinking = thinkingChunks.isEmpty ? nil : thinkingChunks.joined(separator: "\n\n")
+        return (thinking, reply)
+    }
+
+    /// Canonical form for UI: `<think>...</think>{reply}` so MessageBubble can
+    /// render reasoning in a disclosure. Returns just the reply if no thinking.
+    public static func combine(_ text: String) -> String {
+        let parts = split(text)
+        guard let thinking = parts.thinking, !thinking.isEmpty else { return parts.reply }
+        return "<think>\n\(thinking)\n</think>\n\(parts.reply)"
+    }
+}
+
 public actor OllamaService: AIEngineProtocol {
-    private static let baseSystemPrompt = "你是主人桌面上的可爱宠物。回复要简短可爱（1-2句话）。称呼用户为主人。"
+    private static let baseSystemPrompt = "你是主人桌面上的可爱宠物。回复要简短可爱（1-2句话）。称呼用户为主人。直接给出回复，不要展示推理过程；如确需思考，请放在 <think>...</think> 标签内。"
+    private static let maxManagedToolRounds = 8
     private var customSystemPrompt = ""
     private var petProfile: String = ""
     private var availableActions: [String] = []
     private var memories: [String] = []
+    private var structuredMemories: [MemoryContextItem] = []
     private var currentSessionId: String = "default"
     private var sessionHistories: [String: [ChatMessage]] = [:]
+    private var mcpServerConfigurations: [MCPServerConfiguration] = []
+    private var mcpClients: [String: MCPClient] = [:]
 
     private var activeHistory: [ChatMessage] {
         get { sessionHistories[currentSessionId] ?? [] }
@@ -25,22 +168,59 @@ public actor OllamaService: AIEngineProtocol {
             let actionList = availableActions.joined(separator: "、")
             prompt += "\n你可以在回复中用 [ACTION:动作名] 标签来做动作。可用动作：\(actionList)。"
             prompt += "\n每次回复最多用一个动作标签。示例：好开心！[ACTION:celebrate]"
+            prompt += "\n部分动作支持次数后缀，如 somersault（翻跟头）：当用户要求翻 N 个跟头时使用 [ACTION:somersault:N]，N 取 1-8。"
         }
-        if !memories.isEmpty {
+        let structuredBlock = buildStructuredMemoryBlock()
+        if !structuredBlock.isEmpty {
+            prompt += "\n\n" + structuredBlock
+        } else if !memories.isEmpty {
             let memoryList = memories.map { "- \($0)" }.joined(separator: "\n")
             prompt += "\n\n你记住了以下关于用户的信息：\n\(memoryList)"
         }
         return prompt
     }
 
+    private func buildStructuredMemoryBlock() -> String {
+        guard !structuredMemories.isEmpty else { return "" }
+
+        let sorted = structuredMemories.sorted { lhs, rhs in
+            if lhs.importance != rhs.importance { return lhs.importance > rhs.importance }
+            return lhs.category.rawValue < rhs.category.rawValue
+        }
+
+        var grouped: [MemoryCategory: [MemoryContextItem]] = [:]
+        for item in sorted {
+            grouped[item.category, default: []].append(item)
+        }
+
+        let order: [MemoryCategory] = [.fact, .relationship, .preference, .todo, .event]
+        var sections: [String] = []
+        for category in order {
+            guard let items = grouped[category], !items.isEmpty else { continue }
+            let bullets = items.map { item -> String in
+                let marker = item.importance >= 3 ? "⭐ " : "- "
+                return marker + item.content
+            }.joined(separator: "\n")
+            sections.append("[\(category.displayName)]\n\(bullets)")
+        }
+
+        guard !sections.isEmpty else { return "" }
+        return "关于主人的已知信息（请在合适的时候自然地运用，不要生硬地重复）：\n" + sections.joined(separator: "\n\n")
+    }
+
     private var endpoint: URL
+    private var backend: AIBackend
     private var model: String
+    /// For `.openAICompatible` only: sent as `Authorization: Bearer`. Empty = omit header.
+    private var openAIApiKey: String
     private var onConversationUpdated: (@Sendable (String, String, String, String?, String?) async -> Void)?
     private var currentStatus: AIEngineStatus = .notConfigured
 
-    public init(endpoint: URL, model: String) {
+    public init(endpoint: URL, model: String, backend: AIBackend = .ollama, openAIApiKey: String = "") {
         self.endpoint = endpoint
         self.model = model
+        self.backend = backend
+        self.openAIApiKey = openAIApiKey
     }
 
     public var status: AIEngineStatus {
@@ -52,20 +232,74 @@ public actor OllamaService: AIEngineProtocol {
     public func checkConnection() async {
         currentStatus = .connecting
 
+        switch backend {
+        case .ollama:
+            await checkOllamaConnection()
+        case .openAICompatible:
+            await checkOpenAICompatibleConnection()
+        }
+    }
+
+    private func checkOllamaConnection() async {
         do {
-            let url = endpoint.appendingPathComponent("api").appendingPathComponent("tags")
-            let request = URLRequest(url: url)
+            let url = Self.resolveOllamaTagsURL(from: endpoint)
+            var request = URLRequest(url: url)
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
 
             let (_, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse,
                   (200...299).contains(httpResponse.statusCode) else {
-                currentStatus = .notConfigured
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+                currentStatus = .error("HTTP \(statusCode)")
                 return
             }
 
             currentStatus = .ready
         } catch {
-            currentStatus = .notConfigured
+            currentStatus = .error(error.localizedDescription)
+        }
+    }
+
+    private func checkOpenAICompatibleConnection() async {
+        do {
+            var request = URLRequest(url: Self.resolveOpenAIModelsURL(from: endpoint))
+            request.timeoutInterval = 8
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+            applyOpenAIAuthorizationIfNeeded(to: &request)
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                throw Self.httpStatusError(response: response as? HTTPURLResponse, data: data)
+            }
+
+            currentStatus = .ready
+            return
+        } catch {
+            do {
+                var request = try Self.buildOpenAICompatibleChatRequest(
+                    endpoint: endpoint,
+                    model: resolvedModelName(),
+                    history: [],
+                    systemPrompt: "You are a connection health check. Reply with ok.",
+                    userMessage: "ping",
+                    stream: false,
+                    maxTokens: 1
+                )
+                request.timeoutInterval = 120
+                applyOpenAIAuthorizationIfNeeded(to: &request)
+
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse,
+                      (200...299).contains(httpResponse.statusCode) else {
+                    currentStatus = .error(Self.httpStatusError(response: response as? HTTPURLResponse, data: data).localizedDescription)
+                    return
+                }
+
+                currentStatus = .ready
+            } catch {
+                currentStatus = .error(error.localizedDescription)
+            }
         }
     }
 
@@ -79,25 +313,113 @@ public actor OllamaService: AIEngineProtocol {
             }
         }
 
-        let request = try Self.buildChatRequest(
-            endpoint: endpoint,
-            model: model,
-            history: activeHistory,
-            systemPrompt: effectiveSystemPrompt,
-            userMessage: message
-        )
         let userMessage = ChatMessage(role: .user, content: message)
+
+        switch backend {
+        case .ollama:
+            let request = try Self.buildChatRequest(
+                endpoint: endpoint,
+                model: model,
+                history: activeHistory,
+                systemPrompt: effectiveSystemPrompt,
+                userMessage: message
+            )
+
+            return AsyncThrowingStream<String, Error> { continuation in
+                Task {
+                    do {
+                        let stream = try await URLSession.shared.bytes(for: request)
+                        let assistantMessage = try await self.consumeStream(
+                            bytes: stream.0,
+                            response: stream.1,
+                            continuation: continuation,
+                            onToolCall: nil
+                        )
+
+                        self.recordConversation(
+                            userMessage: userMessage,
+                            assistantMessage: assistantMessage
+                        )
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+        case .openAICompatible:
+            var request = try Self.buildOpenAICompatibleChatRequest(
+                endpoint: endpoint,
+                model: resolvedModelName(),
+                history: activeHistory,
+                systemPrompt: effectiveSystemPrompt,
+                userMessage: message,
+                stream: false
+            )
+            applyOpenAIAuthorizationIfNeeded(to: &request)
+
+            return AsyncThrowingStream<String, Error> { continuation in
+                Task {
+                    do {
+                        let (data, response) = try await URLSession.shared.data(for: request)
+                        let assistantMessage = try await self.consumeOpenAIResponse(
+                            data: data,
+                            response: response,
+                            continuation: continuation,
+                            onToolCall: nil
+                        )
+
+                        self.recordConversation(
+                            userMessage: userMessage,
+                            assistantMessage: assistantMessage
+                        )
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+        }
+    }
+
+    public func sendWithTools(
+        message: String,
+        tools: [OllamaTool],
+        onToolCall: @escaping @Sendable (PetToolCall) async -> String?
+    ) async throws -> AsyncThrowingStream<String, Error> {
+        if case .ready = currentStatus {
+            // no-op
+        } else {
+            await checkConnection()
+            guard case .ready = currentStatus else {
+                throw OllamaServiceError.serviceUnavailable
+            }
+        }
+
+        let userMessage = ChatMessage(role: .user, content: message)
+        let baseMessages = Self.buildRequestMessages(
+            history: activeHistory,
+            userMessage: message,
+            systemPrompt: effectiveSystemPrompt
+        )
+
+        let localToolNames = Set(tools.map { $0.function.name })
+        let mcpBindings = await loadMCPToolBindings()
+        let combinedTools = tools + mcpBindings.values.map { $0.descriptor.ollamaTool }
 
         return AsyncThrowingStream<String, Error> { continuation in
             Task {
                 do {
-                    let stream = try await URLSession.shared.bytes(for: request)
-                    let assistantMessage = try await self.consumeStream(
-                        bytes: stream.0,
-                        response: stream.1,
-                        continuation: continuation,
-                        onToolCall: nil
+                    let assistantMessage = try await self.runManagedToolLoop(
+                        initialMessages: baseMessages,
+                        tools: combinedTools,
+                        localToolNames: localToolNames,
+                        mcpBindings: mcpBindings,
+                        onToolCall: onToolCall
                     )
+
+                    if !assistantMessage.isEmpty {
+                        continuation.yield(assistantMessage)
+                    }
 
                     self.recordConversation(
                         userMessage: userMessage,
@@ -111,51 +433,210 @@ public actor OllamaService: AIEngineProtocol {
         }
     }
 
-    public func sendWithTools(
-        message: String,
+    private func runManagedToolLoop(
+        initialMessages: [PayloadMessage],
         tools: [OllamaTool],
-        onToolCall: @escaping @Sendable (PetToolCall) async -> Void
-    ) async throws -> AsyncThrowingStream<String, Error> {
-        if case .ready = currentStatus {
-            // no-op
-        } else {
-            await checkConnection()
-            guard case .ready = currentStatus else {
-                throw OllamaServiceError.serviceUnavailable
-            }
-        }
+        localToolNames: Set<String>,
+        mcpBindings: [String: MCPToolBinding],
+        onToolCall: @escaping @Sendable (PetToolCall) async -> String?
+    ) async throws -> String {
+        var messages = initialMessages
+        var previousToolCallSignatures: [ManagedToolCallSignature] = []
+        var lastToolResults: [String] = []
 
-        let request = try Self.buildChatRequest(
-            endpoint: endpoint,
-            model: model,
-            history: activeHistory,
-            systemPrompt: effectiveSystemPrompt,
-            userMessage: message,
-            tools: tools
-        )
-        let userMessage = ChatMessage(role: .user, content: message)
+        for _ in 0..<Self.maxManagedToolRounds {
+            let response = try await performSingleToolLoopRequest(messages: messages, tools: tools)
+            let normalizedToolCalls = normalizeToolCallsForHistory(response.toolCalls)
 
-        return AsyncThrowingStream<String, Error> { continuation in
-            Task {
-                do {
-                    let stream = try await URLSession.shared.bytes(for: request)
-                    let assistantMessage = try await self.consumeStream(
-                        bytes: stream.0,
-                        response: stream.1,
-                        continuation: continuation,
+            if !normalizedToolCalls.isEmpty {
+                let currentToolCallSignatures = normalizedToolCalls.map(ManagedToolCallSignature.init)
+                if currentToolCallSignatures == previousToolCallSignatures,
+                   !lastToolResults.isEmpty {
+                    return try await finalizeToolLoopWithoutAdditionalTools(
+                        messages: messages,
+                        lastToolResults: lastToolResults
+                    )
+                }
+
+                messages.append(
+                    PayloadMessage.assistantToolCall(
+                        content: response.content ?? "",
+                        toolCalls: Self.payloadToolCalls(from: normalizedToolCalls)
+                    )
+                )
+
+                var currentToolResults: [String] = []
+                for toolCall in normalizedToolCalls {
+                    let result = await executeManagedToolCall(
+                        toolCall,
+                        localToolNames: localToolNames,
+                        mcpBindings: mcpBindings,
                         onToolCall: onToolCall
                     )
-
-                    self.recordConversation(
-                        userMessage: userMessage,
-                        assistantMessage: assistantMessage
-                    )
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
+                    currentToolResults.append(result)
+                    messages.append(Self.toolResultMessage(for: toolCall, content: result, backend: backend))
                 }
+                if let terminalFailureReply = Self.terminalToolFailureReply(for: currentToolResults) {
+                    return terminalFailureReply
+                }
+                if let failureReminder = Self.toolFailureReminder(for: currentToolResults) {
+                    messages.append(
+                        PayloadMessage(
+                            role: ChatMessage.Role.system.rawValue,
+                            content: failureReminder
+                        )
+                    )
+                }
+                previousToolCallSignatures = currentToolCallSignatures
+                lastToolResults = currentToolResults
+                continue
+            }
+
+            return ThinkingStripper.combine(response.content ?? "")
+        }
+
+        if !lastToolResults.isEmpty {
+            return try await finalizeToolLoopWithoutAdditionalTools(
+                messages: messages,
+                lastToolResults: lastToolResults
+            )
+        }
+
+        throw OllamaServiceError.toolLoopLimitExceeded
+    }
+
+    private func performSingleToolLoopRequest(
+        messages: [PayloadMessage],
+        tools: [OllamaTool]?
+    ) async throws -> ParsedChunk {
+        switch backend {
+        case .ollama:
+            let request = try Self.buildChatRequest(
+                endpoint: endpoint,
+                model: model,
+                messages: messages,
+                tools: tools,
+                stream: false
+            )
+
+                        let (data, response) = try await URLSession.shared.data(for: request)
+                        guard let httpResponse = response as? HTTPURLResponse,
+                                    (200...299).contains(httpResponse.statusCode) else {
+                                throw Self.httpStatusError(response: response as? HTTPURLResponse, data: data)
+            }
+            return try Self.parseChatResponse(data)
+        case .openAICompatible:
+            var request = try Self.buildOpenAICompatibleChatRequest(
+                endpoint: endpoint,
+                model: resolvedModelName(),
+                messages: messages,
+                tools: tools,
+                stream: false
+            )
+            applyOpenAIAuthorizationIfNeeded(to: &request)
+
+                        let (data, response) = try await URLSession.shared.data(for: request)
+                        guard let httpResponse = response as? HTTPURLResponse,
+                                    (200...299).contains(httpResponse.statusCode) else {
+                                throw Self.httpStatusError(response: response as? HTTPURLResponse, data: data)
+            }
+            return try Self.parseOpenAIChatResponse(data)
+        }
+    }
+
+    private func finalizeToolLoopWithoutAdditionalTools(
+        messages: [PayloadMessage],
+        lastToolResults: [String]
+    ) async throws -> String {
+        var finalMessages = messages
+        finalMessages.append(
+            PayloadMessage(
+                role: ChatMessage.Role.system.rawValue,
+                content: "You already have the tool results. Do not call any more tools. Reply to the user directly now and summarize the useful outcome instead of repeating raw JSON."
+            )
+        )
+
+        let response = try await performSingleToolLoopRequest(messages: finalMessages, tools: nil)
+        let finalContent = ThinkingStripper.combine(response.content ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !finalContent.isEmpty {
+            return finalContent
+        }
+
+        let fallback = Self.summarizedToolResults(lastToolResults)
+        if !fallback.isEmpty {
+            return fallback
+        }
+
+        throw OllamaServiceError.toolLoopLimitExceeded
+    }
+
+    private func executeManagedToolCall(
+        _ toolCall: PetToolCall,
+        localToolNames: Set<String>,
+        mcpBindings: [String: MCPToolBinding],
+        onToolCall: @escaping @Sendable (PetToolCall) async -> String?
+    ) async -> String {
+        if let binding = mcpBindings[toolCall.functionName] {
+            do {
+                return try await binding.client.callExposedTool(toolCall.functionName, arguments: toolCall.arguments)
+            } catch {
+                return Self.defaultFailedToolResult(toolCall.functionName, message: error.localizedDescription)
             }
         }
+
+        let localResult = await onToolCall(toolCall)
+        if localToolNames.contains(toolCall.functionName) {
+            return localResult ?? Self.defaultSuccessfulToolResult(for: toolCall)
+        }
+        return localResult ?? Self.defaultFailedToolResult(toolCall.functionName, message: "Tool is not registered")
+    }
+
+    private func normalizeToolCallsForHistory(_ toolCalls: [PetToolCall]) -> [PetToolCall] {
+        guard backend == .openAICompatible else {
+            return toolCalls
+        }
+
+        return toolCalls.enumerated().map { index, toolCall in
+            if toolCall.id != nil {
+                return toolCall
+            }
+            return PetToolCall(
+                id: "call_\(UUID().uuidString)_\(index)",
+                functionName: toolCall.functionName,
+                arguments: toolCall.arguments
+            )
+        }
+    }
+
+    private func loadMCPToolBindings() async -> [String: MCPToolBinding] {
+        var bindings: [String: MCPToolBinding] = [:]
+
+        for configuration in mcpServerConfigurations where configuration.enabled {
+            let client = mcpClient(for: configuration)
+            do {
+                let descriptors = try await client.listTools()
+                for descriptor in descriptors {
+                    bindings[descriptor.exposedName] = MCPToolBinding(client: client, descriptor: descriptor)
+                }
+            } catch {
+                // Ignore unavailable MCP servers for the current turn; local tools and
+                // plain chat should continue to work.
+                continue
+            }
+        }
+
+        return bindings
+    }
+
+    private func mcpClient(for configuration: MCPServerConfiguration) -> MCPClient {
+        if let existing = mcpClients[configuration.name] {
+            return existing
+        }
+
+        let client = MCPClient(configuration: configuration)
+        mcpClients[configuration.name] = client
+        return client
     }
 
     public func clearHistory() {
@@ -216,10 +697,81 @@ public actor OllamaService: AIEngineProtocol {
         currentSessionId = sessionId
     }
 
-    public func updateConfig(endpoint: URL, model: String) {
+    public func updateConfig(
+        endpoint: URL,
+        model: String,
+        backend: AIBackend,
+        openAIApiKey: String = "",
+        mcpServers: [MCPServerConfiguration] = []
+    ) async {
         self.endpoint = endpoint
         self.model = model
+        self.backend = backend
+        self.openAIApiKey = openAIApiKey
+        await updateMCPServers(mcpServers)
         currentStatus = .notConfigured
+    }
+
+    public func updateMCPServers(_ configurations: [MCPServerConfiguration]) async {
+        let normalized = configurations.map {
+            MCPServerConfiguration(
+                name: $0.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                transport: $0.transport,
+                command: $0.command.trimmingCharacters(in: .whitespacesAndNewlines),
+                args: $0.args,
+                env: Dictionary(uniqueKeysWithValues: $0.env.compactMap { key, value in
+                    let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmedKey.isEmpty else {
+                        return nil
+                    }
+                    return (trimmedKey, value)
+                }),
+                workingDirectory: $0.workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines),
+                url: $0.url.trimmingCharacters(in: .whitespacesAndNewlines),
+                headers: Dictionary(uniqueKeysWithValues: $0.headers.compactMap { key, value in
+                    let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmedKey.isEmpty else {
+                        return nil
+                    }
+                    return (trimmedKey, value.trimmingCharacters(in: .whitespacesAndNewlines))
+                }),
+                enabled: $0.enabled
+            )
+        }.filter {
+            guard !$0.name.isEmpty else {
+                return false
+            }
+
+            switch $0.transport {
+            case .stdio:
+                return !$0.command.isEmpty
+            case .streamableHTTP:
+                return !$0.url.isEmpty
+            }
+        }
+
+        let currentByName = Dictionary(uniqueKeysWithValues: mcpServerConfigurations.map { ($0.name, $0) })
+        let nextByName = Dictionary(uniqueKeysWithValues: normalized.map { ($0.name, $0) })
+        let staleNames = Set(currentByName.keys).subtracting(nextByName.keys)
+        let changedNames = Set(nextByName.keys).filter { currentByName[$0] != nextByName[$0] }
+        let clientsToClose = (staleNames.union(changedNames)).compactMap { mcpClients.removeValue(forKey: $0) }
+
+        for client in clientsToClose {
+            await client.close()
+        }
+
+        mcpServerConfigurations = normalized
+    }
+
+    private func applyOpenAIAuthorizationIfNeeded(to request: inout URLRequest) {
+        guard backend == .openAICompatible else {
+            return
+        }
+        let trimmed = openAIApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return
+        }
+        request.setValue("Bearer \(trimmed)", forHTTPHeaderField: "Authorization")
     }
 
     public func updateSystemPrompt(_ prompt: String) {
@@ -236,6 +788,12 @@ public actor OllamaService: AIEngineProtocol {
 
     public func updateMemories(_ newMemories: [String]) {
         memories = newMemories
+        structuredMemories = []
+    }
+
+    public func updateStructuredMemories(_ items: [MemoryContextItem]) {
+        structuredMemories = items
+        memories = items.map(\.content)
     }
 
     public func generateProactive(context: String) async throws -> String {
@@ -244,60 +802,129 @@ public actor OllamaService: AIEngineProtocol {
         }
 
         let systemPrompt = effectiveSystemPrompt + "\n你现在要主动和主人说话。根据当前情境说一句话。"
-        let request = try Self.buildChatRequest(
-            endpoint: endpoint,
-            model: model,
-            history: [],
-            systemPrompt: systemPrompt,
-            userMessage: context,
-            stream: false
-        )
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode) else {
-            throw OllamaServiceError.invalidResponse
+        switch backend {
+        case .ollama:
+            let request = try Self.buildChatRequest(
+                endpoint: endpoint,
+                model: model,
+                history: [],
+                systemPrompt: systemPrompt,
+                userMessage: context,
+                stream: false
+            )
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                throw OllamaServiceError.invalidResponse
+            }
+
+            guard let parsed = try? JSONDecoder().decode(NonStreamResponse.self, from: data),
+                  let content = parsed.message?.content else {
+                throw OllamaServiceError.invalidResponse
+            }
+
+            return ThinkingStripper.strip(content)
+        case .openAICompatible:
+            var request = try Self.buildOpenAICompatibleChatRequest(
+                endpoint: endpoint,
+                model: resolvedModelName(),
+                history: [],
+                systemPrompt: systemPrompt,
+                userMessage: context,
+                stream: false
+            )
+            applyOpenAIAuthorizationIfNeeded(to: &request)
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                throw OllamaServiceError.invalidResponse
+            }
+
+            let chunk = try Self.parseOpenAIChatResponse(data)
+            guard let content = chunk.content else {
+                throw OllamaServiceError.invalidResponse
+            }
+
+            return ThinkingStripper.strip(content)
         }
-
-        guard let parsed = try? JSONDecoder().decode(NonStreamResponse.self, from: data),
-              let content = parsed.message?.content else {
-            throw OllamaServiceError.invalidResponse
-        }
-
-        return content.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func extractMemories(from recentMessages: [(role: String, content: String)]) async throws -> [String] {
+        let structured = try await extractStructuredMemories(from: recentMessages)
+        return structured.map(\.content)
+    }
+
+    public func extractStructuredMemories(
+        from recentMessages: [(role: String, content: String)]
+    ) async throws -> [ExtractedMemory] {
         let extractionPrompt = """
-        从以下对话中提取用户的关键信息（偏好、习惯、事实、名字等），每条信息用一个简短的中文句子。
-        只返回 JSON 数组格式，例如：["用户喜欢猫", "用户是程序员"]
-        如果没有新信息，返回空数组 []
+        你是一个记忆提取助手。从以下对话中提取对用户有长期价值的信息。
+
+        只提取：
+        - fact：客观事实（姓名、生日、工作、家庭成员、地点、设备等）
+        - preference：主观偏好（喜欢 / 不喜欢、口味、风格等）
+        - event：已发生的具体事件（有时间点或场景）
+        - todo：用户明确提到的待办或承诺（"我下周要去..."）
+        - relationship：与他人的关系或联系方式
+
+        不要提取：寒暄、临时话题、情绪波动、宠物自己的动作/心情、AI 的回答本身。
+
+        每条记忆写成一句自成独立上下文的中文陈述（不要"他"/"她"之类指代，需补全主语），并评估重要性：
+        - 1：一般（偶然提到的偏好）
+        - 2：重要（生日、工作、家人）
+        - 3：关键（用户明确说"请记住..."）
+
+        若对话里有多条互不重复的长期信息，请拆成多条记忆分别输出，不要合并成一条笼统摘要；只要符合条件，通常可提取 2～8 条（视对话信息量而定）。
+
+        严格返回 JSON 数组，每项结构：
+        {"content": "用户生日是 6 月 3 日", "category": "fact", "importance": 2}
+
+        没有可提取的信息时返回空数组 []。不要解释、不要 Markdown 代码块，只输出 JSON。
         """
 
         let conversationText = recentMessages
             .map { "\($0.role): \($0.content)" }
             .joined(separator: "\n")
-        let request = try Self.buildChatRequest(
-            endpoint: endpoint,
-            model: model,
-            history: [],
-            systemPrompt: extractionPrompt,
-            userMessage: conversationText,
-            stream: false
-        )
 
-        let (responseData, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode) else {
-            return []
+        let responseText: String?
+        switch backend {
+        case .ollama:
+            let request = try Self.buildChatRequest(
+                endpoint: endpoint,
+                model: model,
+                history: [],
+                systemPrompt: extractionPrompt,
+                userMessage: conversationText,
+                stream: false
+            )
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+            responseText = (try? JSONDecoder().decode(NonStreamResponse.self, from: data))?.message?.content
+        case .openAICompatible:
+            var request = try Self.buildOpenAICompatibleChatRequest(
+                endpoint: endpoint,
+                model: resolvedModelName(),
+                history: [],
+                systemPrompt: extractionPrompt,
+                userMessage: conversationText,
+                stream: false
+            )
+            applyOpenAIAuthorizationIfNeeded(to: &request)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+            responseText = try? Self.parseOpenAIChatResponse(data).content
         }
 
-        let parsed = try? JSONDecoder().decode(NonStreamResponse.self, from: responseData)
-        guard let content = parsed?.message?.content else {
-            return []
-        }
-
-        return Self.parseMemoryArray(from: content)
+        guard let responseText else { return [] }
+        let cleanedText = ThinkingStripper.strip(responseText)
+        return Self.parseStructuredMemories(from: cleanedText)
     }
 
     internal static func buildChatRequest(
@@ -309,39 +936,111 @@ public actor OllamaService: AIEngineProtocol {
         tools: [OllamaTool]? = nil,
         stream: Bool = true
     ) throws -> URLRequest {
-        let payload = ChatPayload(
+        try buildChatRequest(
+            endpoint: endpoint,
             model: model,
             messages: buildRequestMessages(
                 history: history,
                 userMessage: userMessage,
                 systemPrompt: systemPrompt
             ),
+            tools: tools,
+            stream: stream
+        )
+    }
+
+    internal static func buildChatRequest(
+        endpoint: URL,
+        model: String,
+        messages: [PayloadMessage],
+        tools: [OllamaTool]? = nil,
+        stream: Bool = true
+    ) throws -> URLRequest {
+        let payload = ChatPayload(
+            model: model,
+            messages: messages,
             stream: stream,
             tools: tools
         )
 
-        var request = URLRequest(url: endpoint.appendingPathComponent("api").appendingPathComponent("chat"))
+        var request = URLRequest(url: resolveOllamaChatURL(from: endpoint))
         request.httpMethod = "POST"
         request.httpBody = try JSONEncoder().encode(payload)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        return request
+    }
+
+    internal static func buildOpenAICompatibleChatRequest(
+        endpoint: URL,
+        model: String,
+        history: [ChatMessage],
+        systemPrompt: String,
+        userMessage: String,
+        tools: [OllamaTool]? = nil,
+        stream: Bool = false,
+        maxTokens: Int? = nil,
+        authorizationBearer: String? = nil
+    ) throws -> URLRequest {
+        try buildOpenAICompatibleChatRequest(
+            endpoint: endpoint,
+            model: model,
+            messages: buildRequestMessages(
+                history: history,
+                userMessage: userMessage,
+                systemPrompt: systemPrompt
+            ),
+            tools: tools,
+            stream: stream,
+            maxTokens: maxTokens,
+            authorizationBearer: authorizationBearer
+        )
+    }
+
+    internal static func buildOpenAICompatibleChatRequest(
+        endpoint: URL,
+        model: String,
+        messages: [PayloadMessage],
+        tools: [OllamaTool]? = nil,
+        stream: Bool = false,
+        maxTokens: Int? = nil,
+        authorizationBearer: String? = nil
+    ) throws -> URLRequest {
+        let payload = OpenAIChatPayload(
+            model: model,
+            messages: messages.map(OpenAIPayloadMessage.init),
+            stream: stream,
+            tools: tools,
+            maxTokens: maxTokens
+        )
+
+        var request = URLRequest(url: resolveOpenAIChatURL(from: endpoint))
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(payload)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        if let bearer = authorizationBearer?.trimmingCharacters(in: .whitespacesAndNewlines), !bearer.isEmpty {
+            request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+        }
         return request
     }
 
     internal static func parseChatResponse(_ line: String) throws -> ParsedChunk {
         let data = Data(line.utf8)
+        return try parseChatResponse(data)
+    }
+
+    internal static func parseChatResponse(_ data: Data) throws -> ParsedChunk {
         let decoder = JSONDecoder()
         let response = try decoder.decode(ResponseLine.self, from: data)
         return ParsedChunk(
             content: response.message?.content ?? "",
-            done: response.done
-            ,
-            toolCalls: response.message?.tool_calls?.compactMap { toolCall in
-                guard let arguments = toolCall.function.arguments else {
-                    return nil
-                }
-                return PetToolCall(
+            done: response.done,
+            toolCalls: response.message?.tool_calls?.map { toolCall in
+                PetToolCall(
+                    id: nil,
                     functionName: toolCall.function.name,
-                    arguments: arguments
+                    arguments: toolCall.function.arguments ?? [:]
                 )
             } ?? []
         )
@@ -359,6 +1058,10 @@ public actor OllamaService: AIEngineProtocol {
         (endpoint, model)
     }
 
+    internal func backendSnapshot() -> AIBackend {
+        backend
+    }
+
     private func consumeStream(
         bytes: URLSession.AsyncBytes,
         response: URLResponse,
@@ -368,12 +1071,16 @@ public actor OllamaService: AIEngineProtocol {
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             if let httpResponse = response as? HTTPURLResponse {
-                throw OllamaServiceError.httpStatus(httpResponse.statusCode)
+                var responseData = Data()
+                for try await byte in bytes {
+                    responseData.append(byte)
+                }
+                throw Self.httpStatusError(response: httpResponse, data: responseData)
             }
             throw OllamaServiceError.invalidResponse
         }
 
-        var assistantContent = ""
+        var rawContent = ""
         var finished = false
 
         for try await line in bytes.lines {
@@ -389,7 +1096,10 @@ public actor OllamaService: AIEngineProtocol {
                 }
             }
             if let content = chunk.content, !content.isEmpty {
-                assistantContent += content
+                rawContent += content
+                // Yield raw token incrementally so the bubble can render the
+                // reasoning live. MessageBubble's parser handles partial states
+                // (open `<think>` without a close yet) and tagless leaks.
                 continuation.yield(content)
             }
 
@@ -403,7 +1113,41 @@ public actor OllamaService: AIEngineProtocol {
             throw OllamaServiceError.incompleteStream
         }
 
-        return assistantContent
+        // Return the canonical `<think>...</think>{reply}` form for history /
+        // DB persistence so reloads parse cleanly even if the live stream had
+        // a tagless leak. The live bubble keeps the raw token stream — both
+        // forms parse to the same (thinking, reply) tuple.
+        return ThinkingStripper.combine(rawContent)
+    }
+
+    private func consumeOpenAIResponse(
+        data: Data,
+        response: URLResponse,
+        continuation: AsyncThrowingStream<String, Error>.Continuation,
+        onToolCall: (@Sendable (PetToolCall) async -> Void)?
+    ) async throws -> String {
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200...299).contains(httpResponse.statusCode) else {
+            if let httpResponse = response as? HTTPURLResponse {
+                throw Self.httpStatusError(response: httpResponse, data: data)
+            }
+            throw OllamaServiceError.invalidResponse
+        }
+
+        let chunk = try Self.parseOpenAIChatResponse(data)
+        if let onToolCall {
+            for call in chunk.toolCalls {
+                await onToolCall(call)
+            }
+        }
+        if let content = chunk.content, !content.isEmpty {
+            let combined = ThinkingStripper.combine(content)
+            if !combined.isEmpty {
+                continuation.yield(combined)
+            }
+            return combined
+        }
+        return ""
     }
 
     private func recordConversation(userMessage: ChatMessage, assistantMessage: String) {
@@ -460,11 +1204,193 @@ public actor OllamaService: AIEngineProtocol {
         messages.append(PayloadMessage(role: ChatMessage.Role.system.rawValue, content: systemPrompt))
 
         let mappedHistory = history.map { message in
-            PayloadMessage(role: message.role.rawValue, content: message.content)
+            // Strip <think>...</think> from prior assistant turns so the model
+            // doesn't see (and try to imitate or get confused by) its own
+            // earlier reasoning. UI keeps the tagged version for display.
+            let content = message.role == .assistant
+                ? ThinkingStripper.strip(message.content)
+                : message.content
+            return PayloadMessage(role: message.role.rawValue, content: content)
         }
         messages.append(contentsOf: mappedHistory)
         messages.append(PayloadMessage(role: ChatMessage.Role.user.rawValue, content: userMessage))
         return messages
+    }
+
+    private static func payloadToolCalls(from toolCalls: [PetToolCall]) -> [PayloadToolCall] {
+        toolCalls.map { toolCall in
+            PayloadToolCall(
+                id: toolCall.id,
+                function: PayloadToolCallFunction(
+                    name: toolCall.functionName,
+                    arguments: .object(toolCall.arguments)
+                )
+            )
+        }
+    }
+
+    private static func toolResultMessage(for toolCall: PetToolCall, content: String, backend: AIBackend) -> PayloadMessage {
+        switch backend {
+        case .ollama:
+            return PayloadMessage(role: "tool", content: content, toolName: toolCall.functionName)
+        case .openAICompatible:
+            return PayloadMessage(role: "tool", content: content, toolCallID: toolCall.id)
+        }
+    }
+
+    private static func defaultSuccessfulToolResult(for toolCall: PetToolCall) -> String {
+        let payload = JSONValue.object([
+            "status": .string("ok"),
+            "tool": .string(toolCall.functionName),
+            "arguments": .object(toolCall.arguments)
+        ])
+        return payload.compactJSONString() ?? "{\"status\":\"ok\"}"
+    }
+
+    private static func defaultFailedToolResult(_ toolName: String, message: String) -> String {
+        let normalizedMessage = normalizedToolFailureMessage(message)
+        let payload = JSONValue.object([
+            "status": .string("error"),
+            "tool": .string(toolName),
+            "message": .string(normalizedMessage)
+        ])
+        return payload.compactJSONString() ?? "{\"status\":\"error\"}"
+    }
+
+    private static func normalizedToolFailureMessage(_ message: String) -> String {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "Tool execution failed."
+        }
+
+        if isAuthenticationFailureMessage(trimmed) {
+            return "MCP server authentication failed. Check the Authorization header or token in MCP settings and try again."
+        }
+
+        return trimmed
+    }
+
+    private static func toolFailureReminder(for results: [String]) -> String? {
+        guard results.contains(where: hasFailedToolResult) else {
+            return nil
+        }
+
+        var reminder = "One or more tool calls failed. Do not claim you completed the task manually, wrote it yourself, or already finished the requested action. Reply directly to the user based on the tool result."
+        if results.contains(where: isAuthenticationFailureResult) {
+            reminder += " If the failure is about authentication or authorization, tell the user to check the MCP Authorization header or token in settings and retry."
+        }
+        return reminder
+    }
+
+    private static func terminalToolFailureReply(for results: [String]) -> String? {
+        guard results.contains(where: isAuthenticationFailureResult) else {
+            return nil
+        }
+
+        let summary = summarizedToolResults(results)
+        if !summary.isEmpty {
+            return summary
+        }
+
+        return "MCP server authentication failed. Check the Authorization header or token in MCP settings and try again."
+    }
+
+    private static func hasFailedToolResult(_ rawResult: String) -> Bool {
+        let trimmed = rawResult.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return false
+        }
+
+        if let object = parsedToolResultObject(from: trimmed) {
+            if object["status"]?.stringValue?.lowercased() == "error" {
+                return true
+            }
+            if object["isError"]?.boolValue == true {
+                return true
+            }
+        }
+
+        return trimmed.localizedCaseInsensitiveContains("tool execution failed")
+    }
+
+    private static func isAuthenticationFailureResult(_ rawResult: String) -> Bool {
+        let trimmed = rawResult.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return false
+        }
+
+        if let object = parsedToolResultObject(from: trimmed),
+           let message = object["message"]?.stringValue,
+           !message.isEmpty {
+            return isAuthenticationFailureMessage(message)
+        }
+
+        return isAuthenticationFailureMessage(trimmed)
+    }
+
+    private static func isAuthenticationFailureMessage(_ message: String) -> Bool {
+        let normalized = message.lowercased()
+        let indicators = [
+            "authentication",
+            "authorization",
+            "unauthorized",
+            "forbidden",
+            "401",
+            "403",
+            "invalid api key",
+            "access denied"
+        ]
+        return indicators.contains { normalized.contains($0) }
+    }
+
+    private static func parsedToolResultObject(from text: String) -> [String: JSONValue]? {
+        guard let data = text.data(using: .utf8),
+              let jsonObject = try? JSONSerialization.jsonObject(with: data),
+              let jsonValue = JSONValue.fromJSONObject(jsonObject) else {
+            return nil
+        }
+
+        return jsonValue.objectValue
+    }
+
+    private static func summarizedToolResults(_ results: [String]) -> String {
+        results
+            .map { summarizeSingleToolResult($0) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func summarizeSingleToolResult(_ rawResult: String) -> String {
+        let trimmed = rawResult.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return ""
+        }
+
+        guard let data = trimmed.data(using: .utf8),
+              let jsonObject = try? JSONSerialization.jsonObject(with: data),
+              let jsonValue = JSONValue.fromJSONObject(jsonObject),
+              let object = jsonValue.objectValue else {
+            return trimmed
+        }
+
+        if let message = object["message"]?.stringValue,
+           !message.isEmpty {
+            return message
+        }
+
+        if let content = object["content"]?.stringValue,
+           !content.isEmpty {
+            return content
+        }
+
+        if let action = object["action"]?.stringValue,
+           !action.isEmpty {
+            let count = max(1, object["count"]?.intValue ?? 1)
+            return count == 1 ? "Completed action: \(action)." : "Completed action: \(action) x\(count)."
+        }
+
+        return trimmed
     }
 
     private static func parseMemoryArray(from text: String) -> [String] {
@@ -485,6 +1411,192 @@ public actor OllamaService: AIEngineProtocol {
         return array
     }
 
+    static func parseStructuredMemories(from text: String) -> [ExtractedMemory] {
+        guard let jsonText = extractFirstJSONArray(from: text),
+              let data = jsonText.data(using: .utf8) else {
+            return []
+        }
+
+        // Primary path: objects with fields.
+        if let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            return raw.compactMap { ExtractedMemory(fromDict: $0) }
+        }
+
+        // Fallback: plain string array — upgrade with default category/importance so older prompts keep working.
+        if let strings = try? JSONSerialization.jsonObject(with: data) as? [String] {
+            return strings
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .map { ExtractedMemory(content: $0, category: .fact, importance: 1) }
+        }
+
+        return []
+    }
+
+    private static func extractFirstJSONArray(from text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("[") { return trimmed }
+        guard let start = trimmed.firstIndex(of: "["),
+              let end = trimmed.lastIndex(of: "]"), start < end else {
+            return nil
+        }
+        return String(trimmed[start...end])
+    }
+
+    private func resolvedModelName() -> String {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return backend.defaultModel
+        }
+        return trimmed
+    }
+
+    internal nonisolated static func resolveOllamaTagsURL(from endpoint: URL) -> URL {
+        let normalizedPath = endpoint.path.lowercased()
+        if normalizedPath.hasSuffix("/api/tags") {
+            return endpoint
+        }
+        if normalizedPath.hasSuffix("/api/chat") {
+            return endpoint.deletingLastPathComponent().appendingPathComponent("tags")
+        }
+        return endpoint.appendingPathComponent("api").appendingPathComponent("tags")
+    }
+
+    internal nonisolated static func resolveOllamaChatURL(from endpoint: URL) -> URL {
+        let normalizedPath = endpoint.path.lowercased()
+        if normalizedPath.hasSuffix("/api/chat") {
+            return endpoint
+        }
+        if normalizedPath.hasSuffix("/api/tags") {
+            return endpoint.deletingLastPathComponent().appendingPathComponent("chat")
+        }
+        return endpoint.appendingPathComponent("api").appendingPathComponent("chat")
+    }
+
+    internal nonisolated static func resolveOpenAIModelsURL(from endpoint: URL) -> URL {
+        let normalizedPath = Self.trimmedLowercasedPath(endpoint)
+        if normalizedPath.hasSuffix("/v1/models") || normalizedPath.hasSuffix("/models") {
+            return endpoint
+        }
+        if normalizedPath.hasSuffix("/v1/chat/completions") {
+            return endpoint
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("models")
+        }
+        if normalizedPath.hasSuffix("/v1/chat") {
+            return endpoint
+                .deletingLastPathComponent()
+                .appendingPathComponent("models")
+        }
+        if normalizedPath.hasSuffix("/v1") {
+            return endpoint.appendingPathComponent("models")
+        }
+        return endpoint.appendingPathComponent("v1").appendingPathComponent("models")
+    }
+
+    internal nonisolated static func resolveOpenAIChatURL(from endpoint: URL) -> URL {
+        let normalizedPath = Self.trimmedLowercasedPath(endpoint)
+        if normalizedPath.hasSuffix("/v1/chat/completions") || normalizedPath.hasSuffix("/chat/completions") {
+            return endpoint
+        }
+        if normalizedPath.hasSuffix("/v1/chat") || normalizedPath.hasSuffix("/chat") {
+            return endpoint.appendingPathComponent("completions")
+        }
+        if normalizedPath.hasSuffix("/v1") {
+            return endpoint
+                .appendingPathComponent("chat")
+                .appendingPathComponent("completions")
+        }
+        if normalizedPath.hasSuffix("/v1/models") {
+            return endpoint
+                .deletingLastPathComponent()
+                .appendingPathComponent("chat")
+                .appendingPathComponent("completions")
+        }
+        return endpoint
+            .appendingPathComponent("v1")
+            .appendingPathComponent("chat")
+            .appendingPathComponent("completions")
+    }
+
+    private nonisolated static func trimmedLowercasedPath(_ url: URL) -> String {
+        let path = url.path.lowercased()
+        if path.count > 1, path.hasSuffix("/") {
+            return String(path.dropLast())
+        }
+        return path
+    }
+
+    private nonisolated static func httpStatusError(response: HTTPURLResponse?, data: Data? = nil) -> OllamaServiceError {
+        OllamaServiceError.httpStatus(response?.statusCode ?? -1, httpErrorMessage(from: data))
+    }
+
+    private nonisolated static func httpErrorMessage(from data: Data?) -> String? {
+        guard let data, !data.isEmpty else {
+            return nil
+        }
+
+        if let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let errorObject = jsonObject["error"] as? [String: Any],
+               let message = errorObject["message"] as? String,
+               !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return message.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            if let message = jsonObject["message"] as? String,
+               !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return message.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            if let error = jsonObject["error"] as? String,
+               !error.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return error.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        guard let body = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !body.isEmpty else {
+            return nil
+        }
+
+        return body
+    }
+
+    internal nonisolated static func parseOpenAIChatResponse(_ data: Data) throws -> ParsedChunk {
+        let decoder = JSONDecoder()
+        let response = try decoder.decode(OpenAIResponse.self, from: data)
+        guard let choice = response.choices.first else {
+            throw OllamaServiceError.invalidResponse
+        }
+
+        // Some reasoning-model gateways (DeepSeek, OpenRouter, vLLM with R1/QwQ)
+        // return chain-of-thought in a separate `reasoning_content` field rather
+        // than wrapped in inline `<think>` tags. Inline-wrap it so the rest of
+        // the pipeline (ThinkingStripper.combine, MessageBubble parser) can
+        // surface it as the disclosure block.
+        let mergedContent: String?
+        let reply = choice.message.content ?? ""
+        let reasoning = choice.message.reasoningContent?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !reasoning.isEmpty {
+            mergedContent = "<think>\n\(reasoning)\n</think>\n\(reply)"
+        } else {
+            mergedContent = choice.message.content
+        }
+
+        return ParsedChunk(
+            content: mergedContent,
+            done: true,
+            toolCalls: choice.message.toolCalls?.map { toolCall in
+                PetToolCall(
+                    id: toolCall.id,
+                    functionName: toolCall.function.name,
+                    arguments: toolCall.function.arguments ?? [:]
+                )
+            } ?? []
+        )
+    }
+
     private struct ChatPayload: Codable {
         let model: String
         let messages: [PayloadMessage]
@@ -492,9 +1604,118 @@ public actor OllamaService: AIEngineProtocol {
         let tools: [OllamaTool]?
     }
 
+    private struct OpenAIChatPayload: Encodable {
+        let model: String
+        let messages: [OpenAIPayloadMessage]
+        let stream: Bool
+        let tools: [OllamaTool]?
+        let maxTokens: Int?
+
+        private enum CodingKeys: String, CodingKey {
+            case model
+            case messages
+            case stream
+            case tools
+            case maxTokens = "max_tokens"
+        }
+    }
+
     internal struct PayloadMessage: Codable {
         let role: String
         let content: String
+        let toolCalls: [PayloadToolCall]?
+        let toolName: String?
+        let toolCallID: String?
+
+        init(
+            role: String,
+            content: String,
+            toolCalls: [PayloadToolCall]? = nil,
+            toolName: String? = nil,
+            toolCallID: String? = nil
+        ) {
+            self.role = role
+            self.content = content
+            self.toolCalls = toolCalls
+            self.toolName = toolName
+            self.toolCallID = toolCallID
+        }
+
+        static func assistantToolCall(content: String, toolCalls: [PayloadToolCall]) -> PayloadMessage {
+            PayloadMessage(role: ChatMessage.Role.assistant.rawValue, content: content, toolCalls: toolCalls)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case role
+            case content
+            case toolCalls = "tool_calls"
+            case toolName = "tool_name"
+            case toolCallID = "tool_call_id"
+        }
+    }
+
+    internal struct PayloadToolCall: Codable {
+        let id: String?
+        let type: String
+        let function: PayloadToolCallFunction
+
+        init(id: String?, type: String = "function", function: PayloadToolCallFunction) {
+            self.id = id
+            self.type = type
+            self.function = function
+        }
+    }
+
+    internal struct PayloadToolCallFunction: Codable {
+        let name: String
+        let arguments: JSONValue
+    }
+
+    private struct OpenAIPayloadMessage: Encodable {
+        let role: String
+        let content: String?
+        let toolCalls: [OpenAIPayloadToolCall]?
+        let toolCallID: String?
+
+        init(_ message: PayloadMessage) {
+            role = message.role
+            if message.toolCalls?.isEmpty == false && message.content.isEmpty {
+                content = nil
+            } else {
+                content = message.content
+            }
+            toolCalls = message.toolCalls?.map(OpenAIPayloadToolCall.init)
+            toolCallID = message.toolCallID
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case role
+            case content
+            case toolCalls = "tool_calls"
+            case toolCallID = "tool_call_id"
+        }
+    }
+
+    private struct OpenAIPayloadToolCall: Encodable {
+        let id: String
+        let type: String
+        let function: OpenAIPayloadToolCallFunction
+
+        init(_ payload: PayloadToolCall) {
+            id = payload.id ?? "call_\(UUID().uuidString)"
+            type = payload.type
+            function = OpenAIPayloadToolCallFunction(payload.function)
+        }
+    }
+
+    private struct OpenAIPayloadToolCallFunction: Encodable {
+        let name: String
+        let arguments: String
+
+        init(_ payload: PayloadToolCallFunction) {
+            name = payload.name
+            arguments = payload.arguments.compactJSONString() ?? "{}"
+        }
     }
 
     private struct NonStreamResponse: Decodable {
@@ -549,12 +1770,12 @@ public actor OllamaService: AIEngineProtocol {
 
         struct ToolCallFunction: Decodable {
             let name: String
-            let arguments: [String: String]?
+            let arguments: [String: JSONValue]?
 
             init(from decoder: Decoder) throws {
                 let container = try decoder.container(keyedBy: CodingKeys.self)
                 name = try container.decode(String.self, forKey: .name)
-                if let dictionary = try? container.decode([String: String].self, forKey: .arguments) {
+                if let dictionary = try? container.decode([String: JSONValue].self, forKey: .arguments) {
                     arguments = dictionary
                 } else if let argumentsString = try? container.decode(String.self, forKey: .arguments) {
                     arguments = Self.decodeArguments(from: argumentsString)
@@ -568,14 +1789,93 @@ public actor OllamaService: AIEngineProtocol {
                 case arguments
             }
 
-            private static func decodeArguments(from raw: String) -> [String: String]? {
+            private static func decodeArguments(from raw: String) -> [String: JSONValue]? {
                 guard let data = raw.data(using: .utf8),
                       let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     return nil
                 }
-                var output: [String: String] = [:]
+                var output: [String: JSONValue] = [:]
                 for (key, value) in decoded {
-                    output[key] = String(describing: value)
+                    guard let jsonValue = JSONValue.fromJSONObject(value) else {
+                        return nil
+                    }
+                    output[key] = jsonValue
+                }
+                return output
+            }
+        }
+    }
+
+    private struct OpenAIResponse: Decodable {
+        let choices: [Choice]
+
+        struct Choice: Decodable {
+            let message: Message
+        }
+
+        struct Message: Decodable {
+            let role: String
+            let content: String?
+            let reasoningContent: String?
+            let toolCalls: [ToolCall]?
+
+            private enum CodingKeys: String, CodingKey {
+                case role
+                case content
+                case reasoningContent = "reasoning_content"
+                case reasoning
+                case toolCalls = "tool_calls"
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                role = try container.decode(String.self, forKey: .role)
+                content = try container.decodeIfPresent(String.self, forKey: .content)
+                // DeepSeek/QwQ-style APIs use `reasoning_content`; some gateways
+                // (OpenRouter, certain vLLM configs) use `reasoning`. Accept both.
+                reasoningContent = (try? container.decodeIfPresent(String.self, forKey: .reasoningContent))
+                    ?? (try? container.decodeIfPresent(String.self, forKey: .reasoning))
+                toolCalls = try container.decodeIfPresent([ToolCall].self, forKey: .toolCalls)
+            }
+        }
+
+        struct ToolCall: Decodable {
+            let id: String?
+            let function: ToolCallFunction
+        }
+
+        struct ToolCallFunction: Decodable {
+            let name: String
+            let arguments: [String: JSONValue]?
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                name = try container.decode(String.self, forKey: .name)
+                if let dictionary = try? container.decode([String: JSONValue].self, forKey: .arguments) {
+                    arguments = dictionary
+                } else if let argumentsString = try? container.decode(String.self, forKey: .arguments) {
+                    arguments = Self.decodeArguments(from: argumentsString)
+                } else {
+                    arguments = nil
+                }
+            }
+
+            private enum CodingKeys: String, CodingKey {
+                case name
+                case arguments
+            }
+
+            private static func decodeArguments(from raw: String) -> [String: JSONValue]? {
+                guard let data = raw.data(using: .utf8),
+                      let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    return nil
+                }
+                var output: [String: JSONValue] = [:]
+                for (key, value) in decoded {
+                    guard let jsonValue = JSONValue.fromJSONObject(value) else {
+                        return nil
+                    }
+                    output[key] = jsonValue
                 }
                 return output
             }
@@ -587,24 +1887,45 @@ public actor OllamaService: AIEngineProtocol {
         let done: Bool
         let toolCalls: [PetToolCall]
     }
+
+    private struct MCPToolBinding {
+        let client: MCPClient
+        let descriptor: MCPClient.ToolDescriptor
+    }
+
+    private struct ManagedToolCallSignature: Equatable {
+        let functionName: String
+        let arguments: [String: JSONValue]
+
+        init(_ toolCall: PetToolCall) {
+            functionName = toolCall.functionName
+            arguments = toolCall.arguments
+        }
+    }
 }
 
 public enum OllamaServiceError: LocalizedError {
     case serviceUnavailable
-    case httpStatus(Int)
+    case httpStatus(Int, String?)
     case invalidResponse
     case incompleteStream
+    case toolLoopLimitExceeded
 
     public var errorDescription: String? {
         switch self {
         case .serviceUnavailable:
-            "Ollama service is not configured or unavailable"
-        case .httpStatus(let status):
-            "Ollama API returned HTTP status: \(status)"
+            return "Ollama service is not configured or unavailable"
+        case .httpStatus(let status, let body):
+            if let body, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "Ollama API returned HTTP status \(status): \(body)"
+            }
+            return "Ollama API returned HTTP status: \(status)"
         case .invalidResponse:
-            "Ollama API returned invalid response"
+            return "Ollama API returned invalid response"
         case .incompleteStream:
-            "Ollama streaming response did not contain completion marker"
+            return "Ollama streaming response did not contain completion marker"
+        case .toolLoopLimitExceeded:
+            return "Tool calling exceeded the maximum number of rounds"
         }
     }
 }

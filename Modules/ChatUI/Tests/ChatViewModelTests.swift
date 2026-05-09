@@ -211,6 +211,33 @@ final class ChatViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.conversations.first?.lastMessage, "reply")
     }
 
+    func testSendMessage_streamingChunks_updatesConversationPreviewWithFinalReply() {
+        let expectation = XCTestExpectation(description: "assistant replied")
+        let viewModel = ChatViewModel(
+            sendToAI: { _, _ in
+                AsyncThrowingStream { continuation in
+                    continuation.yield("Hello")
+                    continuation.yield(", ")
+                    continuation.yield("VitaPet")
+                    continuation.finish()
+                }
+            },
+            getAIStatus: { .ready }
+        )
+        let thread = ConversationThread(id: "c1", type: .single, participantIds: [UUID()], title: "Chat 1")
+        viewModel.loadConversations([thread])
+        viewModel.onAssistantReplied = {
+            expectation.fulfill()
+        }
+
+        viewModel.inputText = "hi"
+        viewModel.sendMessage()
+        wait(for: [expectation], timeout: 1.0)
+
+        XCTAssertEqual(viewModel.messages.last?.content, "Hello, VitaPet")
+        XCTAssertEqual(viewModel.conversations.first?.lastMessage, "Hello, VitaPet")
+    }
+
     func testSwitchingConversation_updatesCurrentMessagesAfterSending() {
         let replyExpectation = XCTestExpectation(description: "assistant replied")
         let viewModel = ChatViewModel(

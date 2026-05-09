@@ -46,6 +46,9 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertEqual(manager.config.pets[0].name, "Cat")
         XCTAssertEqual(manager.config.pets[0].spritePack, "default")
         XCTAssertTrue(manager.config.enabledCapabilities.isEmpty)
+        XCTAssertEqual(manager.config.aiBackend, "ollama")
+        XCTAssertEqual(manager.config.openAIApiKey, "")
+        XCTAssertEqual(manager.config.mcpServersJSON, "")
         XCTAssertEqual(
             manager.config.locale,
             (Locale.preferredLanguages.first ?? Locale.current.identifier).hasPrefix("zh") ? "zh-Hans" : "en"
@@ -69,6 +72,23 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertEqual(manager.config.githubToken, "")
         XCTAssertFalse(manager.config.webhookEnabled)
         XCTAssertEqual(manager.config.webhookPort, 19280)
+    }
+
+    func testDefaultConfig_hasMemoryWorkerDefaults() {
+        let storageURL = makeStorageURL()
+        defer { try? FileManager.default.removeItem(at: storageURL) }
+        let manager = ConfigManager(storageURL: storageURL)
+
+        XCTAssertFalse(manager.config.memoryWorkerEnabled)
+        XCTAssertEqual(manager.config.memoryWorkerEndpoint, "https://memory.example.com")
+        XCTAssertEqual(manager.config.memoryWorkerAuthMode, "basic")
+        XCTAssertEqual(manager.config.memoryWorkerUsername, "")
+        XCTAssertEqual(manager.config.memoryWorkerSecret, "")
+        XCTAssertEqual(manager.config.memoryWorkerNamespace, "default")
+        XCTAssertEqual(manager.config.memoryWorkerScope, "user")
+        XCTAssertEqual(manager.config.memoryWorkerSubject, "demo-user")
+        XCTAssertEqual(manager.config.memoryWorkerQueryLimit, 5)
+        XCTAssertEqual(manager.config.memoryWorkerCreateHorizon, "daily")
     }
 
     func testUpdate_modifiesConfig() throws {
@@ -150,14 +170,27 @@ final class ConfigManagerTests: XCTestCase {
             disabledPlugins: ["demo.plugin"],
             locale: "en",
             ollamaEndpoint: "http://127.0.0.1:11435",
+            aiBackend: "openai-compatible",
             ollamaModel: "qwen2.5",
+            openAIApiKey: "sk-test",
+            mcpServersJSON: #"[{"name":"filesystem","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]"#,
             aiSystemPrompt: "Be concise",
             aiProactiveEnabled: false,
             aiProactiveInterval: 90,
-            githubToken: "ghp_test_token",
+            githubToken: "github-token-placeholder",
             webhookEnabled: true,
             webhookPort: 18080,
-            spaceMode: "singleSpace"
+            spaceMode: "singleSpace",
+            memoryWorkerEnabled: true,
+            memoryWorkerEndpoint: "https://memory.example.com",
+            memoryWorkerAuthMode: "bearer",
+            memoryWorkerUsername: "tester",
+            memoryWorkerSecret: "demo-credential",
+            memoryWorkerNamespace: "default",
+            memoryWorkerScope: "user",
+            memoryWorkerSubject: "demo-user",
+            memoryWorkerQueryLimit: 9,
+            memoryWorkerCreateHorizon: "weekly"
         )
 
         let data = try PropertyListEncoder().encode(config)
@@ -165,13 +198,26 @@ final class ConfigManagerTests: XCTestCase {
 
         XCTAssertEqual(decoded.aiProactiveEnabled, false)
         XCTAssertEqual(decoded.aiProactiveInterval, 90)
-        XCTAssertEqual(decoded.githubToken, "ghp_test_token")
+        XCTAssertEqual(decoded.githubToken, "github-token-placeholder")
         XCTAssertEqual(decoded.webhookEnabled, true)
         XCTAssertEqual(decoded.webhookPort, 18080)
         XCTAssertEqual(decoded.ollamaEndpoint, "http://127.0.0.1:11435")
+        XCTAssertEqual(decoded.aiBackend, "openai-compatible")
         XCTAssertEqual(decoded.ollamaModel, "qwen2.5")
+        XCTAssertEqual(decoded.openAIApiKey, "sk-test")
+        XCTAssertEqual(decoded.mcpServersJSON, #"[{"name":"filesystem","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]"#)
         XCTAssertEqual(decoded.aiSystemPrompt, "Be concise")
         XCTAssertEqual(decoded.spaceMode, "singleSpace")
+        XCTAssertEqual(decoded.memoryWorkerEnabled, true)
+        XCTAssertEqual(decoded.memoryWorkerEndpoint, "https://memory.example.com")
+        XCTAssertEqual(decoded.memoryWorkerAuthMode, "bearer")
+        XCTAssertEqual(decoded.memoryWorkerUsername, "tester")
+        XCTAssertEqual(decoded.memoryWorkerSecret, "demo-credential")
+        XCTAssertEqual(decoded.memoryWorkerNamespace, "default")
+        XCTAssertEqual(decoded.memoryWorkerScope, "user")
+        XCTAssertEqual(decoded.memoryWorkerSubject, "demo-user")
+        XCTAssertEqual(decoded.memoryWorkerQueryLimit, 9)
+        XCTAssertEqual(decoded.memoryWorkerCreateHorizon, "weekly")
         XCTAssertEqual(decoded.pets[0].gender, "female")
         XCTAssertEqual(decoded.pets[0].age, "2岁")
         XCTAssertEqual(decoded.pets[0].personality, "活泼")
@@ -280,6 +326,7 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertEqual(decoded.pets[0].positionX, 210)
         XCTAssertEqual(decoded.pets[0].positionY, 240)
         XCTAssertEqual(decoded.selectedSpritePack, "legacy-pack")
+        XCTAssertEqual(decoded.aiBackend, "ollama")
     }
 
     func testUpdate_persistsMultiplePets() throws {

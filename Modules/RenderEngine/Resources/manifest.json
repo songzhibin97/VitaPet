@@ -99,6 +99,11 @@
       "谁的消息？",
       "刷刷手机~"
     ],
+    "punch": [
+      "嘿！",
+      "吃我一拳！",
+      "收招！"
+    ],
     "play": [
       "好好玩！",
       "再来一次！",
@@ -157,6 +162,11 @@
     "spin": [
       "转圈圈~",
       "好晕~"
+    ],
+    "somersault": [
+      "看好了！",
+      "翻给你看！",
+      "哼！认真起来了！"
     ],
     "stretch": [
       "伸懒腰~",
@@ -506,6 +516,13 @@
       ],
       "loop": false
     },
+    "punch": {
+      "frameInterval": 0.14,
+      "frames": [
+        "pet_angry_0"
+      ],
+      "loop": false
+    },
     "write": {
       "frameInterval": 0.4,
       "frames": [
@@ -517,6 +534,13 @@
       "frameInterval": 0.4,
       "frames": [
         "pet_yawn_0"
+      ],
+      "loop": false
+    },
+    "somersault": {
+      "frameInterval": 0.15,
+      "frames": [
+        "pet_angry_0"
       ],
       "loop": false
     }

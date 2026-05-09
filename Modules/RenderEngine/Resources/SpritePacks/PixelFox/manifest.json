@@ -505,6 +505,13 @@
       ],
       "loop": false
     },
+    "punch": {
+      "frameInterval": 0.14,
+      "frames": [
+        "fox_angry_0"
+      ],
+      "loop": false
+    },
     "write": {
       "frameInterval": 0.4,
       "frames": [

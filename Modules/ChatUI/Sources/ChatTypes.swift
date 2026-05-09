@@ -2,7 +2,7 @@ import Foundation
 
 /// 与 `AIEngine` 中保持结构一致的聊天模型定义。
 /// ChatUI 通过闭包接收 AI 回调，避免直接依赖 `AIEngine` 模块。
-public struct ChatMessage: Identifiable, Sendable {
+public struct ChatMessage: Identifiable, Sendable, Equatable {
     public let id: UUID
     public let role: Role
     public let content: String
@@ -10,7 +10,7 @@ public struct ChatMessage: Identifiable, Sendable {
     public let petId: UUID?
     public let petName: String?
 
-    public enum Role: String, Sendable {
+    public enum Role: String, Sendable, Equatable {
         case user
         case assistant
         case system

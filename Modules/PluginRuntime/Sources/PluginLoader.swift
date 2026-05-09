@@ -52,12 +52,10 @@ public struct PluginLoader: Sendable {
             do {
                 return try load(bundleAt: candidate)
             } catch {
-                if developerMode {
-                    Self.logger.warning("Skipping plugin at \(candidate.path, privacy: .public): \(String(describing: error), privacy: .public)")
-                    return nil
-                }
-
-                throw error
+                // Never fail the whole directory: one bad/corrupt bundle should not unload
+                // every other plugin (e.g. built-in SitReminder / HourlyChime).
+                Self.logger.warning("Skipping plugin at \(candidate.path, privacy: .public): \(String(describing: error), privacy: .public)")
+                return nil
             }
         }
     }

@@ -43,6 +43,7 @@ public struct StatisticsView: View {
         "scared": "害怕",
         "climb": "攀爬",
         "wave": "招手",
+        "punch": "打拳",
         "nod": "点头",
         "sneeze": "打喷嚏",
         "scratch": "挠痒",

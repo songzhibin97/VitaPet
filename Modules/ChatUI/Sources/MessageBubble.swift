@@ -1,37 +1,171 @@
 import SwiftUI
 
 @MainActor
-public struct MessageBubble: View {
+public struct MessageBubble: View, Equatable {
     let message: ChatMessage
+    let isStreaming: Bool
+    let showsThinking: Bool
+    private let parsedContent: ParsedMessage
+    @State private var thinkingExpanded: Bool = true
 
-    public init(message: ChatMessage) {
+    nonisolated public static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
+        lhs.message == rhs.message
+            && lhs.isStreaming == rhs.isStreaming
+            && lhs.showsThinking == rhs.showsThinking
+    }
+
+    public init(message: ChatMessage, isStreaming: Bool = false, showsThinking: Bool = true) {
         self.message = message
+        self.isStreaming = isStreaming
+        self.showsThinking = showsThinking
+        self.parsedContent = Self.split(message.content)
     }
 
     public var body: some View {
-        HStack {
+        HStack(alignment: .top, spacing: 0) {
             if isUserMessage {
-                Spacer(minLength: 48)
+                Spacer(minLength: 56)
             }
 
-            VStack(alignment: isUserMessage ? .trailing : .leading, spacing: 6) {
-                bubbleBody
+            VStack(alignment: isUserMessage ? .trailing : .leading, spacing: 4) {
+                if showsPetHeader, let petName = message.petName {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(petAccentColor)
+                            .frame(width: 7, height: 7)
+                        Text(petName)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(petAccentColor)
+                    }
+                    .padding(.horizontal, 4)
+                }
+
+                if showsThinking, let thinking = parsedContent.thinking {
+                    thinkingDisclosure(thinking: thinking)
+                }
+
+                bubble
 
                 Text(timestampText)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
             }
-            .frame(maxWidth: 420, alignment: isUserMessage ? .trailing : .leading)
+            .frame(maxWidth: 460, alignment: isUserMessage ? .trailing : .leading)
 
             if !isUserMessage {
-                Spacer(minLength: 48)
+                Spacer(minLength: 56)
             }
         }
-        .frame(maxWidth: .infinity, alignment: isUserMessage ? .trailing : .leading)
     }
 
-    private var isUserMessage: Bool {
-        message.role == .user
+    private var bubble: some View {
+        Text(LocalizedStringKey(parsedContent.reply.isEmpty ? " " : parsedContent.reply))
+            .textSelection(.enabled)
+            .foregroundStyle(foregroundColor)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(bubbleColor, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .shadow(color: isUserMessage ? Color.blue.opacity(0.15) : Color.black.opacity(0.04), radius: 6, x: 0, y: 2)
+            .overlay(alignment: isUserMessage ? .bottomTrailing : .bottomLeading) {
+                if isStreaming {
+                    StreamingCursor()
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                }
+            }
+    }
+
+    private func thinkingDisclosure(thinking: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    thinkingExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: thinkingExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2)
+                    Text("💭 思考过程")
+                        .font(.caption.weight(.medium))
+                }
+                .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+
+            if thinkingExpanded {
+                Text(thinking)
+                    .font(.caption.italic())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(10)
+                    .background(
+                        Color.secondary.opacity(0.08),
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    )
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private struct ParsedMessage {
+        let thinking: String?
+        let reply: String
+    }
+
+    /// Parse the live or canonical assistant content into reasoning + reply.
+    /// Handles four states the streaming bubble can land in:
+    ///   - no tag at all → all reply
+    ///   - `<think>...</think>{reply}` → split cleanly
+    ///   - `<think>...` mid-stream (close hasn't arrived) → show partial thinking, no reply yet
+    ///   - tagless leak `{reasoning}</think>{reply}` → reclassify prefix as thinking
+    private static func split(_ text: String) -> ParsedMessage {
+        let hasOpen = text.range(of: "<think>", options: .caseInsensitive) != nil
+        let hasClose = text.range(of: "</think>", options: .caseInsensitive) != nil
+        if !hasOpen && !hasClose {
+            return ParsedMessage(thinking: nil, reply: text)
+        }
+
+        if let openRange = text.range(of: "<think>", options: .caseInsensitive) {
+            if let closeRange = text.range(
+                of: "</think>",
+                options: .caseInsensitive,
+                range: openRange.upperBound..<text.endIndex
+            ) {
+                let thinking = String(text[openRange.upperBound..<closeRange.lowerBound])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let before = String(text[text.startIndex..<openRange.lowerBound])
+                let after = String(text[closeRange.upperBound..<text.endIndex])
+                let reply = (before + after).trimmingCharacters(in: .whitespacesAndNewlines)
+                return ParsedMessage(thinking: thinking.isEmpty ? nil : thinking, reply: reply)
+            }
+            // Open tag, no close yet — surface the in-progress reasoning.
+            let before = String(text[text.startIndex..<openRange.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let thinking = String(text[openRange.upperBound..<text.endIndex])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return ParsedMessage(thinking: thinking.isEmpty ? nil : thinking, reply: before)
+        }
+
+        // Tagless leak: stray </think> with no opener (DeepSeek-R1 sometimes
+        // does this). Treat everything before the close as reasoning.
+        if let closeRange = text.range(of: "</think>", options: .caseInsensitive) {
+            let thinking = String(text[text.startIndex..<closeRange.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let reply = String(text[closeRange.upperBound..<text.endIndex])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return ParsedMessage(thinking: thinking.isEmpty ? nil : thinking, reply: reply)
+        }
+
+        return ParsedMessage(thinking: nil, reply: text)
+    }
+
+    private var isUserMessage: Bool { message.role == .user }
+
+    private var showsPetHeader: Bool {
+        message.role == .assistant && (message.petName?.isEmpty == false)
     }
 
     private var bubbleColor: Color {
@@ -39,7 +173,7 @@ public struct MessageBubble: View {
         case .user:
             return .blue
         case .assistant:
-            return Color(nsColor: .quaternaryLabelColor).opacity(0.14)
+            return Color(nsColor: .quaternaryLabelColor).opacity(0.18)
         case .system:
             return Color(nsColor: .tertiaryLabelColor).opacity(0.18)
         }
@@ -49,58 +183,29 @@ public struct MessageBubble: View {
         message.role == .user ? .white : .primary
     }
 
-    @ViewBuilder
-    private var bubbleBody: some View {
-        HStack(spacing: 0) {
-            if showsPetAccent {
-                RoundedRectangle(cornerRadius: 1, style: .continuous)
-                    .fill(petAccentColor)
-                    .frame(width: 2)
-                    .padding(.vertical, 8)
-                    .padding(.leading, 8)
-            }
-
-            VStack(alignment: isUserMessage ? .trailing : .leading, spacing: 0) {
-                if showsPetAccent, let petName = message.petName {
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(petAccentColor)
-                            .frame(width: 8, height: 8)
-                        Text(petName)
-                            .font(.caption2)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(petAccentColor)
-                    }
-                    .padding(.bottom, 2)
-                }
-
-                Text(message.content)
-                    .textSelection(.enabled)
-                    .foregroundStyle(foregroundColor)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity, alignment: isUserMessage ? .trailing : .leading)
-        }
-        .background(bubbleColor, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-
-    private var showsPetAccent: Bool {
-        message.role == .assistant && message.petName != nil
-    }
-
     private var petAccentColor: Color {
-        petColor(for: message.petId)
-    }
-
-    private func petColor(for petId: UUID?) -> Color {
-        guard let petId else { return .secondary }
+        guard let petId = message.petId else { return .secondary }
         let colors: [Color] = [.blue, .green, .orange, .purple, .pink, .teal, .indigo, .mint]
-        let index = abs(petId.hashValue) % colors.count
-        return colors[index]
+        return colors[abs(petId.hashValue) % colors.count]
     }
 
     private var timestampText: String {
         message.timestamp.formatted(date: .omitted, time: .shortened)
+    }
+}
+
+private struct StreamingCursor: View {
+    @State private var visible = true
+
+    var body: some View {
+        Circle()
+            .fill(Color.secondary.opacity(0.8))
+            .frame(width: 6, height: 6)
+            .opacity(visible ? 1 : 0.15)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
+                    visible = false
+                }
+            }
     }
 }

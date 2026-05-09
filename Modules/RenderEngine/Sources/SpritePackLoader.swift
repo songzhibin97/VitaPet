@@ -183,6 +183,12 @@ public struct SpritePackLoader: Sendable {
                 frameInterval: 0.15,
                 loop: false
             )
+        case .punch:
+            return .init(
+                frames: ["pet_angry_0"],
+                frameInterval: 0.14,
+                loop: false
+            )
         default:
             let frameCount = loopingStates.contains(state) || state == .run ? 4 : 3
             let frames = (0..<frameCount).map { "pet_\(state.rawValue)_\($0)" }
@@ -199,7 +205,7 @@ public struct SpritePackLoader: Sendable {
                 frameInterval = 0.5
             case .think:
                 frameInterval = 0.3
-            case .chat, .wave, .cheer, .alert, .pickup, .land, .trip, .spin, .love, .dance, .play, .roll, .climb, .angry, .scared, .sneeze:
+            case .chat, .wave, .cheer, .alert, .pickup, .land, .trip, .spin, .love, .dance, .play, .roll, .climb, .angry, .scared, .sneeze, .punch:
                 frameInterval = 0.15
             case .sad, .shy, .confused, .peek, .gift, .read, .write, .phone, .listen, .hidePeek, .type, .groom, .nod, .headShake, .scratch:
                 frameInterval = 0.2
