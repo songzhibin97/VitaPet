@@ -12,6 +12,12 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private struct PreparedConversationRequest {
+        let stream: AsyncThrowingStream<String, Error>
+        let targetPets: [PetIdentity]
+        let isGroupChat: Bool
+    }
+
     private var petWindowControllers: [UUID: PetWindowController] = [:]
     private var chatViewModel: ChatViewModel!
     private var chatController: ChatWindowController!
@@ -47,6 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pomodoroController = PomodoroController()
     private var conversationTurnCount = 0
     private var chatPathSomersaultFired = false
+    private var chatPathToolActionFired = false
     private static let memoryExtractionEveryNTurns = 2
     private var memoryRemoteSyncTask: Task<Void, Never>?
     /// 周期性把本地未同步的记忆推到远端，避免单次失败后只能等下次抽取/重启才重传。
@@ -112,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             endpointValue: initialEndpointValue
         )
         let initialModel = Self.normalizedAIModel(configManager.config.ollamaModel, backend: initialBackend)
+        let initialMCPServers = Self.decodedMCPServers(from: configManager.config.mcpServersJSON)
         let initialEndpoint = URL(string: initialEndpointValue) ?? URL(string: "http://localhost:11434")!
         let ollamaService = OllamaService(
             endpoint: initialEndpoint,
@@ -126,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             self.memoryWorkerService = nil
         }
+        await ollamaService.updateMCPServers(initialMCPServers)
         await ollamaService.updateSystemPrompt(configManager.config.aiSystemPrompt)
 
         Task {
@@ -134,8 +143,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let chatViewModel = ChatViewModel(
-            sendToAI: { message, _ in
-                try await ollamaService.send(message: message)
+            sendToAI: { [weak self] message, _ in
+                guard let self else {
+                    throw OllamaServiceError.serviceUnavailable
+                }
+
+                guard let chatViewModel = await MainActor.run(body: { self.chatViewModel }) else {
+                    throw OllamaServiceError.serviceUnavailable
+                }
+
+                let targetPetIDs = await MainActor.run {
+                    self.resolvedConversationTargetPetIDs(for: chatViewModel)
+                }
+                let sessionId = await MainActor.run {
+                    chatViewModel.selectedConversationId
+                        ?? self.fallbackConversationId(for: targetPetIDs)
+                        ?? "default"
+                }
+                let userSomersaultCount = await MainActor.run {
+                    Self.parseSomersaultCount(from: message)
+                }
+                let preparedRequest = try await self.prepareConversationRequest(
+                    text: message,
+                    targetPetIDs: targetPetIDs,
+                    sessionId: sessionId,
+                    userSomersaultCount: userSomersaultCount,
+                    markChatToolActions: true
+                )
+                return preparedRequest.stream
             },
             getAIStatus: {
                 Self.chatUIStatus(from: await ollamaService.status)
@@ -159,6 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 self.chatPathSomersaultFired = false
+                self.chatPathToolActionFired = false
                 for controller in self.petWindowControllers.values {
                     await controller.handleAnimationTrigger(.userInteract)
                 }
@@ -171,7 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 // 解析最后一条助手消息中的 [ACTION:...] 标签，触发动画并清理可见文本
-                var firedAnyAction = self.chatPathSomersaultFired
+                    var firedAnyAction = self.chatPathSomersaultFired || self.chatPathToolActionFired
                 if let chatViewModel,
                    let last = chatViewModel.currentMessages.last,
                    last.role == .assistant {
@@ -200,6 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 self.chatPathSomersaultFired = false
+                self.chatPathToolActionFired = false
                 self.conversationTurnCount += 1
                 if self.conversationTurnCount % Self.memoryExtractionEveryNTurns == 0 {
                     Task { await self.runMemoryExtractionCycle() }
@@ -243,7 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
-        let onSaveAIConfig: @MainActor (String, String, String, AIBackend, String) -> Void = { [weak self, weak configManager] endpoint, model, aiSystemPrompt, backend, openAIApiKey in
+        let onSaveAIConfig: @MainActor (String, String, String, AIBackend, String, String) -> Void = { [weak self, weak configManager] endpoint, model, aiSystemPrompt, backend, openAIApiKey, mcpServersJSON in
             guard let self,
                   let configManager else {
                 return
@@ -251,6 +288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let trimmedPrompt = aiSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
             let trimmedOpenAIKey = openAIApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedMCPServersJSON = Self.normalizedMCPServersJSON(mcpServersJSON)
+            let resolvedMCPServers = Self.decodedMCPServers(from: normalizedMCPServersJSON)
             let resolvedEndpointValue = Self.normalizedAIEndpoint(endpoint)
             let currentBackend = Self.inferredAIBackend(
                 preferred: Self.resolvedAIBackend(from: configManager.config.aiBackend),
@@ -270,6 +309,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     $0.aiBackend = effectiveBackend.rawValue
                     $0.ollamaModel = resolvedModel
                     $0.openAIApiKey = trimmedOpenAIKey
+                    $0.mcpServersJSON = normalizedMCPServersJSON
                     $0.aiSystemPrompt = trimmedPrompt
                 }
             } catch {
@@ -281,7 +321,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     endpoint: resolvedEndpoint,
                     model: resolvedModel,
                     backend: effectiveBackend,
-                    openAIApiKey: trimmedOpenAIKey
+                    openAIApiKey: trimmedOpenAIKey,
+                    mcpServers: resolvedMCPServers
                 )
                 await ollamaService.updateSystemPrompt(trimmedPrompt)
                 await ollamaService.checkConnection()
@@ -678,6 +719,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             },
             openAIApiKey: { [weak configManager] in
                 configManager?.config.openAIApiKey ?? ""
+            },
+            mcpServersJSON: { [weak configManager] in
+                configManager?.config.mcpServersJSON ?? ""
             },
             aiSystemPrompt: { [weak configManager] in
                 configManager?.config.aiSystemPrompt ?? ""
@@ -1154,23 +1198,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let currentParticipants = Set(chatViewModel.currentParticipantIds)
             let effectiveTargetPetIDs = currentParticipants.isEmpty ? targetPetIDs : currentParticipants
 
-            let behaviorActions = self.primaryPetController?.debugListBehaviors() ?? []
-            let animActions = AnimationState.allCases.filter { $0 != .idle && $0 != .drag }.map(\.rawValue)
-            let uniqueActions = Array(Set(behaviorActions + animActions)).sorted()
-            let tool = OllamaTool.petActionTool(availableActions: uniqueActions)
-
-            // Update system prompt with current available actions
-            Task { await ollamaService.updateAvailableActions(uniqueActions) }
-
             // 用户输入快路径：识别「翻N个跟头/跟斗/筋斗」直接触发，不依赖模型工具调用
             let userSomersaultCount = Self.parseSomersaultCount(from: text)
 
             Task { @MainActor in
-                if let selectedConversationId = chatViewModel.selectedConversationId {
-                    await ollamaService.switchSession(selectedConversationId)
-                } else if let fallbackConversationId = self.fallbackConversationId(for: effectiveTargetPetIDs) {
+                if chatViewModel.selectedConversationId == nil,
+                   let fallbackConversationId = self.fallbackConversationId(for: effectiveTargetPetIDs) {
                     chatViewModel.selectConversation(fallbackConversationId)
-                    await ollamaService.switchSession(fallbackConversationId)
                 }
 
                 for (id, controller) in self.petWindowControllers where effectiveTargetPetIDs.contains(id) {
@@ -1186,61 +1220,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             Task {
                 do {
-                    let systemPrompt = self.configManager.config.aiSystemPrompt
-                    await ollamaService.updateSystemPrompt(systemPrompt)
-
-                    await self.refreshMemoryContext()
-
-                    let targetPets = self.configManager.config.pets.filter { effectiveTargetPetIDs.contains($0.id) }
-                    let isGroupChat = effectiveTargetPetIDs.count > 1
                     let sessionId = await MainActor.run {
                         if let selectedConversationId = chatViewModel.selectedConversationId {
                             return selectedConversationId
                         }
                         return self.fallbackConversationId(for: effectiveTargetPetIDs) ?? "default"
                     }
-                    await ollamaService.switchSession(sessionId)
-
-                    if isGroupChat {
-                        let petInfos = targetPets.map {
-                            PetProfileInfo(
-                                id: $0.id,
-                                name: $0.name,
-                                gender: $0.gender,
-                                age: $0.age,
-                                personality: $0.personality,
-                                hobbies: $0.hobbies
-                            )
-                        }
-                        let groupProfile = await ollamaService.buildGroupChatProfile(pets: petInfos)
-                        await ollamaService.updatePetProfile(groupProfile)
-                    } else if let firstTarget = targetPets.first {
-                        let profile = self.buildPetProfileDescription(for: firstTarget)
-                        await ollamaService.updatePetProfile(profile)
-                    }
-
-                    let stream = try await ollamaService.sendWithTools(
-                        message: text,
-                        tools: [tool],
-                        onToolCall: { [weak self] toolCall in
-                            guard let self else {
-                                return
-                            }
-
-                            if toolCall.functionName == "pet_action",
-                               let action = toolCall.arguments["action"] {
-                                if action == "somersault" && userSomersaultCount != nil {
-                                    return  // 用户输入已经触发过，避免重复翻
-                                }
-                                let count = max(1, min(toolCall.arguments["count"].flatMap(Int.init) ?? 1, 8))
-                                await MainActor.run {
-                                    for (id, controller) in self.petWindowControllers where effectiveTargetPetIDs.contains(id) {
-                                        controller.executeAIAction(action, count: count)
-                                    }
-                                }
-                            }
-                        }
+                    let preparedRequest = try await self.prepareConversationRequest(
+                        text: text,
+                        targetPetIDs: effectiveTargetPetIDs,
+                        sessionId: sessionId,
+                        userSomersaultCount: userSomersaultCount,
+                        markChatToolActions: false
                     )
+                    let stream = preparedRequest.stream
+                    let targetPets = preparedRequest.targetPets
+                    let isGroupChat = preparedRequest.isGroupChat
 
                     var fullResponse = ""
                     for try await chunk in stream {
@@ -2666,6 +2661,123 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return parts.joined(separator: "")
     }
 
+    private func resolvedConversationTargetPetIDs(for chatViewModel: ChatViewModel) -> Set<UUID> {
+        let participantIDs = Set(chatViewModel.currentParticipantIds)
+        if !participantIDs.isEmpty {
+            return participantIDs
+        }
+        return Set(configManager.config.pets.map(\.id))
+    }
+
+    private func buildConversationActionTool() -> (tool: OllamaTool, availableActions: [String]) {
+        let behaviorActions = primaryPetController?.debugListBehaviors() ?? []
+        let animationActions = AnimationState.allCases
+            .filter { $0 != .idle && $0 != .drag }
+            .map(\.rawValue)
+        let uniqueActions = Array(Set(behaviorActions + animationActions)).sorted()
+        return (OllamaTool.petActionTool(availableActions: uniqueActions), uniqueActions)
+    }
+
+    private func prepareConversationRequest(
+        text: String,
+        targetPetIDs: Set<UUID>,
+        sessionId: String,
+        userSomersaultCount: Int?,
+        markChatToolActions: Bool
+    ) async throws -> PreparedConversationRequest {
+        guard let ollamaService else {
+            throw OllamaServiceError.serviceUnavailable
+        }
+
+        let (tool, uniqueActions) = buildConversationActionTool()
+        await ollamaService.updateAvailableActions(uniqueActions)
+
+        let systemPrompt = configManager.config.aiSystemPrompt
+        await ollamaService.updateSystemPrompt(systemPrompt)
+        await refreshMemoryContext()
+
+        let targetPets = configManager.config.pets.filter { targetPetIDs.contains($0.id) }
+        let isGroupChat = targetPets.count > 1
+        await ollamaService.switchSession(sessionId)
+
+        if isGroupChat {
+            let petInfos = targetPets.map {
+                PetProfileInfo(
+                    id: $0.id,
+                    name: $0.name,
+                    gender: $0.gender,
+                    age: $0.age,
+                    personality: $0.personality,
+                    hobbies: $0.hobbies
+                )
+            }
+            let groupProfile = await ollamaService.buildGroupChatProfile(pets: petInfos)
+            await ollamaService.updatePetProfile(groupProfile)
+        } else if let firstTarget = targetPets.first {
+            let profile = buildPetProfileDescription(for: firstTarget)
+            await ollamaService.updatePetProfile(profile)
+        } else {
+            await ollamaService.updatePetProfile("")
+        }
+
+        let stream = try await ollamaService.sendWithTools(
+            message: text,
+            tools: [tool],
+            onToolCall: { [weak self] toolCall in
+                guard let self else {
+                    return nil
+                }
+                return await self.handleLocalConversationToolCall(
+                    toolCall,
+                    targetPetIDs: targetPetIDs,
+                    userSomersaultCount: userSomersaultCount,
+                    markChatToolActions: markChatToolActions
+                )
+            }
+        )
+
+        return PreparedConversationRequest(stream: stream, targetPets: targetPets, isGroupChat: isGroupChat)
+    }
+
+    private func handleLocalConversationToolCall(
+        _ toolCall: PetToolCall,
+        targetPetIDs: Set<UUID>,
+        userSomersaultCount: Int?,
+        markChatToolActions: Bool
+    ) async -> String? {
+        guard toolCall.functionName == "pet_action",
+              let action = toolCall.arguments["action"]?.stringValue else {
+            return nil
+        }
+
+        if action == "somersault", let userSomersaultCount {
+            let payload = JSONValue.object([
+                "status": .string("ok"),
+                "tool": .string(toolCall.functionName),
+                "action": .string(action),
+                "count": .number(Double(userSomersaultCount)),
+                "source": .string("user_fast_path")
+            ])
+            return payload.compactJSONString()
+        }
+
+        let count = max(1, min(toolCall.arguments["count"]?.intValue ?? 1, 8))
+        for (id, controller) in petWindowControllers where targetPetIDs.contains(id) {
+            controller.executeAIAction(action, count: count)
+        }
+        if markChatToolActions {
+            chatPathToolActionFired = true
+        }
+
+        let payload = JSONValue.object([
+            "status": .string("ok"),
+            "tool": .string(toolCall.functionName),
+            "action": .string(action),
+            "count": .number(Double(count))
+        ])
+        return payload.compactJSONString()
+    }
+
     private func installMainMenuIfNeeded() {
         guard NSApp.mainMenu == nil else {
             return
@@ -3217,6 +3329,19 @@ private extension AppDelegate {
         }
 
         return trimmed
+    }
+
+    static func normalizedMCPServersJSON(_ rawValue: String) -> String {
+        rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func decodedMCPServers(from rawValue: String) -> [MCPServerConfiguration] {
+        do {
+            return try MCPServerConfiguration.decodeList(from: normalizedMCPServersJSON(rawValue))
+        } catch {
+            AppLogger.error("Failed to decode MCP server config: \(error.localizedDescription)")
+            return []
+        }
     }
 
     static func resolvedMemoryWorkerAuthMode(from rawValue: String) -> MemoryWorkerAuthMode {

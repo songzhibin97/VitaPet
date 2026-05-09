@@ -65,6 +65,18 @@ private actor ConversationUpdateRecorder {
     }
 }
 
+private actor ToolCallRecorder {
+    private var calls: [PetToolCall] = []
+
+    func record(_ call: PetToolCall) {
+        calls.append(call)
+    }
+
+    func all() -> [PetToolCall] {
+        calls
+    }
+}
+
 private extension URLRequest {
     func bodyDataForTesting() -> Data? {
         if let httpBody {
@@ -580,5 +592,375 @@ final class OllamaServiceTests: XCTestCase {
         XCTAssertEqual(config.model, "qwen2.5")
         let backend = await service.backendSnapshot()
         XCTAssertEqual(backend, .openAICompatible)
+    }
+
+    func testSendWithTools_replaysToolResultsForOpenAICompatible() async throws {
+        let service = OllamaService(
+            endpoint: URL(string: "http://unit.test")!,
+            model: "auto",
+            backend: .openAICompatible
+        )
+        let toolRecorder = ToolCallRecorder()
+        let completionRequestsObserved = expectation(description: "tool loop requests observed")
+        completionRequestsObserved.expectedFulfillmentCount = 2
+        let lock = NSLock()
+        var completionRequestCount = 0
+
+        OllamaServiceURLProtocol.install { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+
+            if request.url?.path == "/v1/models" {
+                return (response, Data(#"{"data":[]}"#.utf8))
+            }
+
+            if request.url?.path == "/v1/chat/completions" {
+                completionRequestsObserved.fulfill()
+
+                let body = try XCTUnwrap(request.bodyDataForTesting())
+                let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+                let messages = try XCTUnwrap(object["messages"] as? [[String: Any]])
+
+                lock.lock()
+                completionRequestCount += 1
+                let currentRequest = completionRequestCount
+                lock.unlock()
+
+                if currentRequest == 1 {
+                    XCTAssertEqual(messages.count, 2)
+                    XCTAssertEqual(messages[0]["role"] as? String, "system")
+                    XCTAssertEqual(messages[1]["role"] as? String, "user")
+
+                    let payload = Data(
+                        #"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"pet_action","arguments":"{\"action\":\"wave\",\"count\":2}"}}]}}]}"#.utf8
+                    )
+                    return (response, payload)
+                }
+
+                XCTAssertEqual(messages.count, 4)
+                XCTAssertEqual(messages[2]["role"] as? String, "assistant")
+                let assistantToolCalls = try XCTUnwrap(messages[2]["tool_calls"] as? [[String: Any]])
+                let assistantFunction = try XCTUnwrap(assistantToolCalls.first?["function"] as? [String: Any])
+                XCTAssertEqual(assistantFunction["name"] as? String, "pet_action")
+                let argumentsString = try XCTUnwrap(assistantFunction["arguments"] as? String)
+                let argumentsData = Data(argumentsString.utf8)
+                let argumentsObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: argumentsData) as? [String: Any])
+                XCTAssertEqual(argumentsObject["action"] as? String, "wave")
+                XCTAssertEqual(argumentsObject["count"] as? Int, 2)
+                XCTAssertEqual(messages[3]["role"] as? String, "tool")
+                XCTAssertEqual(messages[3]["tool_call_id"] as? String, "call_1")
+                XCTAssertEqual(messages[3]["content"] as? String, "pet_action_done")
+
+                let payload = Data(
+                    #"{"choices":[{"message":{"role":"assistant","content":"已经挥手啦"}}]}"#.utf8
+                )
+                return (response, payload)
+            }
+
+            return (response, Data("{}".utf8))
+        }
+
+        let stream = try await service.sendWithTools(
+            message: "挥挥手",
+            tools: [OllamaTool.petActionTool(availableActions: ["wave"])],
+            onToolCall: { toolCall in
+                await toolRecorder.record(toolCall)
+                return "pet_action_done"
+            }
+        )
+
+        var collected = ""
+        for try await chunk in stream {
+            collected += chunk
+        }
+
+        let recordedCalls = await toolRecorder.all()
+        XCTAssertEqual(recordedCalls.count, 1)
+        XCTAssertEqual(recordedCalls.first?.functionName, "pet_action")
+        XCTAssertEqual(recordedCalls.first?.id, "call_1")
+        XCTAssertEqual(recordedCalls.first?.arguments["action"]?.stringValue, "wave")
+        XCTAssertEqual(recordedCalls.first?.arguments["count"]?.intValue, 2)
+        XCTAssertEqual(collected, "已经挥手啦")
+        await fulfillment(of: [completionRequestsObserved], timeout: 1.0)
+    }
+
+    func testSendWithTools_forcesFinalReplyAfterRepeatedIdenticalToolCall() async throws {
+        let service = OllamaService(
+            endpoint: URL(string: "http://unit.test")!,
+            model: "auto",
+            backend: .openAICompatible
+        )
+        let toolRecorder = ToolCallRecorder()
+        let completionRequestsObserved = expectation(description: "tool loop fallback requests observed")
+        completionRequestsObserved.expectedFulfillmentCount = 3
+        let lock = NSLock()
+        var completionRequestCount = 0
+
+        let mealTool = OllamaTool.mcpTool(
+            name: "recommend_meal",
+            description: "Recommend a meal for the user.",
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "day": .object([
+                        "type": .string("string")
+                    ])
+                ])
+            ])
+        )
+
+        OllamaServiceURLProtocol.install { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+
+            if request.url?.path == "/v1/models" {
+                return (response, Data(#"{"data":[]}"#.utf8))
+            }
+
+            if request.url?.path == "/v1/chat/completions" {
+                completionRequestsObserved.fulfill()
+
+                let body = try XCTUnwrap(request.bodyDataForTesting())
+                let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+                let messages = try XCTUnwrap(object["messages"] as? [[String: Any]])
+
+                lock.lock()
+                completionRequestCount += 1
+                let currentRequest = completionRequestCount
+                lock.unlock()
+
+                if currentRequest == 1 {
+                    XCTAssertEqual(messages.count, 2)
+                    XCTAssertNotNil(object["tools"])
+
+                    let payload = Data(
+                        #"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"recommend_meal","arguments":"{\"day\":\"tomorrow\"}"}}]}}]}"#.utf8
+                    )
+                    return (response, payload)
+                }
+
+                if currentRequest == 2 {
+                    XCTAssertEqual(messages.count, 4)
+                    XCTAssertNotNil(object["tools"])
+                    XCTAssertEqual(messages[3]["role"] as? String, "tool")
+                    XCTAssertEqual(messages[3]["tool_call_id"] as? String, "call_1")
+                    XCTAssertEqual(messages[3]["content"] as? String, "推荐明天吃冬瓜酿肉")
+
+                    let payload = Data(
+                        #"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_2","type":"function","function":{"name":"recommend_meal","arguments":"{\"day\":\"tomorrow\"}"}}]}}]}"#.utf8
+                    )
+                    return (response, payload)
+                }
+
+                XCTAssertEqual(messages.count, 5)
+                XCTAssertNil(object["tools"])
+                XCTAssertEqual(messages[4]["role"] as? String, "system")
+                let reminder = try XCTUnwrap(messages[4]["content"] as? String)
+                XCTAssertTrue(reminder.contains("Do not call any more tools"))
+
+                let payload = Data(
+                    #"{"choices":[{"message":{"role":"assistant","content":"明天吃冬瓜酿肉吧，适合两个人。"}}]}"#.utf8
+                )
+                return (response, payload)
+            }
+
+            return (response, Data("{}".utf8))
+        }
+
+        let stream = try await service.sendWithTools(
+            message: "明天吃什么",
+            tools: [mealTool],
+            onToolCall: { toolCall in
+                await toolRecorder.record(toolCall)
+                return "推荐明天吃冬瓜酿肉"
+            }
+        )
+
+        var collected = ""
+        for try await chunk in stream {
+            collected += chunk
+        }
+
+        let recordedCalls = await toolRecorder.all()
+        XCTAssertEqual(recordedCalls.count, 1)
+        XCTAssertEqual(recordedCalls.first?.functionName, "recommend_meal")
+        XCTAssertEqual(recordedCalls.first?.arguments["day"]?.stringValue, "tomorrow")
+        XCTAssertEqual(collected, "明天吃冬瓜酿肉吧，适合两个人。")
+        await fulfillment(of: [completionRequestsObserved], timeout: 1.0)
+    }
+
+    func testMCPServerConfigurationDecodeList_acceptsNamedStreamableHTTPServers() throws {
+        let json = #"""
+        {
+          "mcpServers": {
+            "mcp-chinese-fortune": {
+              "type": "streamable_http",
+              "url": "https://example.com/fortune/mcp",
+              "headers": {
+                "Authorization": "Bearer fortune-token"
+              }
+            },
+            "howtocook-mcp": {
+              "type": "streamable_http",
+              "url": "https://example.com/howtocook/mcp",
+              "headers": {
+                "Authorization": "Bearer cook-token"
+              }
+            }
+          }
+        }
+        """#
+
+        let configurations = try MCPServerConfiguration.decodeList(from: json)
+        XCTAssertEqual(configurations.count, 2)
+
+        let byName = Dictionary(uniqueKeysWithValues: configurations.map { ($0.name, $0) })
+        XCTAssertEqual(byName["mcp-chinese-fortune"]?.transport, .streamableHTTP)
+        XCTAssertEqual(byName["mcp-chinese-fortune"]?.url, "https://example.com/fortune/mcp")
+        XCTAssertEqual(byName["mcp-chinese-fortune"]?.headers["Authorization"], "Bearer fortune-token")
+        XCTAssertEqual(byName["howtocook-mcp"]?.transport, .streamableHTTP)
+        XCTAssertEqual(byName["howtocook-mcp"]?.url, "https://example.com/howtocook/mcp")
+        XCTAssertEqual(byName["howtocook-mcp"]?.headers["Authorization"], "Bearer cook-token")
+    }
+
+    func testMCPClient_supportsStreamableHTTPTransport() async throws {
+        let configuration = MCPServerConfiguration(
+            name: "howtocook-mcp",
+            transport: .streamableHTTP,
+            url: "https://unit.test/mcp",
+            headers: ["Authorization": "Bearer unit-token"]
+        )
+        let client = MCPClient(configuration: configuration)
+        let requestOrderLock = NSLock()
+        var requestMethods: [String] = []
+
+        OllamaServiceURLProtocol.install { request in
+            let responseURL = try XCTUnwrap(request.url)
+            let body = try XCTUnwrap(request.bodyDataForTesting())
+            let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+            let method = try XCTUnwrap(object["method"] as? String)
+            let headers = request.allHTTPHeaderFields ?? [:]
+
+            requestOrderLock.lock()
+            requestMethods.append(method)
+            requestOrderLock.unlock()
+
+            XCTAssertEqual(headers["Authorization"], "Bearer unit-token")
+            XCTAssertEqual(headers["Accept"], "application/json, text/event-stream")
+
+            switch method {
+            case "initialize":
+                XCTAssertNil(headers["Mcp-Session-Id"])
+                XCTAssertEqual(object["id"] as? Int, 1)
+                let params = try XCTUnwrap(object["params"] as? [String: Any])
+                XCTAssertEqual(params["protocolVersion"] as? String, "2025-03-26")
+
+                let response = HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: [
+                        "Content-Type": "application/json",
+                        "Mcp-Session-Id": "session-1"
+                    ]
+                )!
+                let payload = Data(
+                    #"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"howtocook-mcp","version":"1.0.0"}}}"#.utf8
+                )
+                return (response, payload)
+
+            case "notifications/initialized":
+                XCTAssertEqual(headers["Mcp-Session-Id"], "session-1")
+                XCTAssertNil(object["id"])
+
+                let response = HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 202,
+                    httpVersion: nil,
+                    headerFields: [
+                        "Content-Type": "application/json",
+                        "Mcp-Session-Id": "session-1"
+                    ]
+                )!
+                return (response, Data())
+
+            case "tools/list":
+                XCTAssertEqual(headers["Mcp-Session-Id"], "session-1")
+                XCTAssertEqual(object["id"] as? Int, 2)
+                let params = try XCTUnwrap(object["params"] as? [String: Any])
+                XCTAssertTrue(params.isEmpty)
+
+                let response = HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: [
+                        "Content-Type": "application/json",
+                        "Mcp-Session-Id": "session-1"
+                    ]
+                )!
+                let payload = Data(
+                    #"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"lookup-recipe","description":"Find a recipe","inputSchema":{"type":"object","properties":{"dish":{"type":"string"}},"required":["dish"]}}]}}"#.utf8
+                )
+                return (response, payload)
+
+            case "tools/call":
+                XCTAssertEqual(headers["Mcp-Session-Id"], "session-1")
+                XCTAssertEqual(object["id"] as? Int, 3)
+                let params = try XCTUnwrap(object["params"] as? [String: Any])
+                XCTAssertEqual(params["name"] as? String, "lookup-recipe")
+                let arguments = try XCTUnwrap(params["arguments"] as? [String: Any])
+                XCTAssertEqual(arguments["dish"] as? String, "番茄炒蛋")
+
+                let response = HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: [
+                        "Content-Type": "application/json",
+                        "Mcp-Session-Id": "session-1"
+                    ]
+                )!
+                let payload = Data(
+                    #"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"番茄炒蛋做法"}]}}"#.utf8
+                )
+                return (response, payload)
+
+            default:
+                XCTFail("Unexpected MCP method: \(method)")
+                let response = HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 500,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                return (response, Data())
+            }
+        }
+
+        let tools = try await client.listTools()
+        XCTAssertEqual(tools.count, 1)
+        XCTAssertEqual(tools.first?.exposedName, "mcp_howtocook_mcp_lookup_recipe")
+        XCTAssertEqual(tools.first?.description, "[MCP:howtocook-mcp] Find a recipe")
+
+        let result = try await client.callExposedTool(
+            "mcp_howtocook_mcp_lookup_recipe",
+            arguments: ["dish": .string("番茄炒蛋")]
+        )
+        XCTAssertEqual(result, "番茄炒蛋做法")
+        await client.close()
+
+        requestOrderLock.lock()
+        let recordedMethods = requestMethods
+        requestOrderLock.unlock()
+        XCTAssertEqual(recordedMethods, ["initialize", "notifications/initialized", "tools/list", "tools/call"])
     }
 }

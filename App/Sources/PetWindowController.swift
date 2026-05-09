@@ -759,18 +759,29 @@ public final class PetWindowController: NSWindowController {
         DispatchQueue.main.asyncAfter(deadline: .now() + prepDelay) { [weak self, weak window] in
             guard let self, let window else { return }
             let stepState = TimerStepState()
+            let targetOrigin = NSPoint(x: targetX, y: startOrigin.y)
             self.movementTimer?.invalidate()
             self.movementTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / fps, repeats: true) { [weak self, weak window] timer in
                 stepState.value += 1
-                guard let self, let window else { timer.invalidate(); return }
                 let progress = min(1.0, Double(stepState.value) / Double(steps))
                 let x = startOrigin.x + actualDistance * CGFloat(progress)
-                window.setFrameOrigin(NSPoint(x: x, y: startOrigin.y))
-                self.repositionBubble()
-                if progress >= 1.0 {
+                let shouldFinish = progress >= 1.0
+                if shouldFinish {
                     timer.invalidate()
-                    self.movementTimer = nil
-                    self.persistWindowPosition()
+                }
+
+                Task { @MainActor [weak self, weak window] in
+                    guard let self, let window else {
+                        return
+                    }
+
+                    window.setFrameOrigin(shouldFinish ? targetOrigin : NSPoint(x: x, y: startOrigin.y))
+                    self.repositionBubble()
+
+                    if shouldFinish {
+                        self.movementTimer = nil
+                        self.persistWindowPosition()
+                    }
                 }
             }
         }

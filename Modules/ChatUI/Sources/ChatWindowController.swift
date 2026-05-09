@@ -27,6 +27,7 @@ public final class ChatWindowController: NSWindowController {
     private var aiModel: @MainActor () -> String = { "llama3.2" }
     private var aiStatus: @MainActor () -> AIEngineStatus = { .notConfigured }
     private var openAIApiKey: @MainActor () -> String = { "" }
+    private var mcpServersJSON: @MainActor () -> String = { "" }
     private var aiSystemPrompt: @MainActor () -> String = { "" }
     private var memoryWorkerEnabled: @MainActor () -> Bool = { false }
     private var memoryWorkerEndpoint: @MainActor () -> String = { "https://memory.example.com" }
@@ -39,7 +40,7 @@ public final class ChatWindowController: NSWindowController {
     private var onTestConnection: @MainActor () -> Void = {}
     private var onTestAIMemoryConnection: @MainActor () async -> String? = { nil }
     private var onTestAIMemoryWrite: @MainActor () async -> String? = { nil }
-    private var onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend, String) -> Void = { _, _, _, _, _ in }
+    private var onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend, String, String) -> Void = { _, _, _, _, _, _ in }
     private var onSaveAIMemoryConfig: @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = { _, _, _, _, _, _, _, _ in }
     private var githubToken: @MainActor () -> String = { "" }
     private var webhookEnabled: @MainActor () -> Bool = { false }
@@ -174,6 +175,7 @@ public final class ChatWindowController: NSWindowController {
                 aiBackend: aiBackend(),
                 ollamaModel: aiModel(),
                 openAIApiKey: openAIApiKey(),
+                mcpServersJSON: mcpServersJSON(),
                 aiSystemPrompt: aiSystemPrompt(),
                 memoryWorkerEnabled: memoryWorkerEnabled(),
                 memoryWorkerEndpoint: memoryWorkerEndpoint(),
@@ -321,6 +323,7 @@ public final class ChatWindowController: NSWindowController {
         aiBackend: @escaping @MainActor () -> AIEngine.AIBackend,
         aiModel: @escaping @MainActor () -> String,
         openAIApiKey: @escaping @MainActor () -> String = { "" },
+        mcpServersJSON: @escaping @MainActor () -> String = { "" },
         aiSystemPrompt: @escaping @MainActor () -> String,
         memoryWorkerEnabled: @escaping @MainActor () -> Bool = { false },
         memoryWorkerEndpoint: @escaping @MainActor () -> String = { "https://memory.example.com" },
@@ -334,13 +337,14 @@ public final class ChatWindowController: NSWindowController {
         onTestConnection: @escaping @MainActor () -> Void = {},
         onTestAIMemoryConnection: @escaping @MainActor () async -> String? = { nil },
         onTestAIMemoryWrite: @escaping @MainActor () async -> String? = { nil },
-        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend, String) -> Void = { _, _, _, _, _ in },
+        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend, String, String) -> Void = { _, _, _, _, _, _ in },
         onSaveAIMemoryConfig: @escaping @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = { _, _, _, _, _, _, _, _ in }
     ) {
         self.aiEndpoint = aiEndpoint
         self.aiBackend = aiBackend
         self.aiModel = aiModel
         self.openAIApiKey = openAIApiKey
+        self.mcpServersJSON = mcpServersJSON
         self.aiSystemPrompt = aiSystemPrompt
         self.memoryWorkerEnabled = memoryWorkerEnabled
         self.memoryWorkerEndpoint = memoryWorkerEndpoint

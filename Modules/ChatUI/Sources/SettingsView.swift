@@ -123,16 +123,43 @@ private enum PluginTemplateOption: String, CaseIterable, Identifiable {
     }
 }
 
-private enum AISystemPromptEditor {
-    /// 达到该字符数后允许纵向滚动，较短时关闭以避免空白区域仍可拖动。
-    private static let scrollCharacterThreshold = 96
-    /// 显式换行达到该「行数」后也允许滚动（避免仅按字数时多行短句无法滚动）。
-    private static let scrollLineCountThreshold = 5
+private enum AISystemPromptSummary {
+    static func statusText(for prompt: String) -> String {
+        trimmed(prompt).isEmpty ? "使用默认" : "已自定义"
+    }
 
-    static func allowsVerticalScroll(for text: String) -> Bool {
-        if text.count >= scrollCharacterThreshold { return true }
-        let lineCount = text.split(separator: "\n", omittingEmptySubsequences: false).count
-        return lineCount >= scrollLineCountThreshold
+    static func descriptionText(for prompt: String) -> String {
+        let trimmedPrompt = trimmed(prompt)
+        guard !trimmedPrompt.isEmpty else {
+            return "点击设置系统提示词"
+        }
+
+        let singleLinePreview = trimmedPrompt.replacingOccurrences(of: "\n", with: " ")
+        guard singleLinePreview.count > 60 else {
+            return singleLinePreview
+        }
+
+        return String(singleLinePreview.prefix(60)) + "…"
+    }
+
+    private static func trimmed(_ prompt: String) -> String {
+        prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+enum MCPSettingsSummary {
+    static let placeholderJSON = "{\n  \"mcpServers\": {\n    \"filesystem\": {\n      \"type\": \"stdio\",\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/Users/me/Desktop\"]\n    }\n  }\n}"
+
+    static func statusText(for json: String) -> String {
+        trimmed(json).isEmpty ? "未配置" : "已配置"
+    }
+
+    static func descriptionText(for json: String) -> String {
+        trimmed(json).isEmpty ? "点击设置 MCP Servers" : "点击查看或编辑 MCP Servers"
+    }
+
+    private static func trimmed(_ json: String) -> String {
+        json.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -193,7 +220,12 @@ public struct SettingsView: View {
     @State private var aiBackend: AIEngine.AIBackend
     @State private var ollamaModel: String
     @State private var openAIApiKey: String
+    @State private var mcpServersJSON: String
+    @State private var mcpServersDraft: String
     @State private var aiSystemPrompt: String
+    @State private var aiSystemPromptDraft: String
+    @State private var showMCPEditor = false
+    @State private var showAISystemPromptEditor = false
     @State private var memoryWorkerEnabled: Bool
     @State private var memoryWorkerEndpoint: String
     @State private var memoryWorkerAuthMode: String
@@ -252,7 +284,7 @@ public struct SettingsView: View {
     private let onTestConnection: @MainActor () -> Void
     private let onTestAIMemoryConnection: @MainActor () async -> String?
     private let onTestAIMemoryWrite: @MainActor () async -> String?
-    private let onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend, String) -> Void
+    private let onSaveAIConfig: @MainActor (String, String, String, AIEngine.AIBackend, String, String) -> Void
     private let onSaveAIMemoryConfig: @MainActor (Bool, String, String, String, String, String, String, Int) -> Void
     private let onSaveNotificationConfig: @MainActor (String, Bool, Int, String) -> Void
     private let onUpdatePet: @MainActor (UUID, String, String, Double, String, String, String, String) -> Void
@@ -291,6 +323,7 @@ public struct SettingsView: View {
         aiBackend: AIEngine.AIBackend = .ollama,
         ollamaModel: String = "llama3.2",
         openAIApiKey: String = "",
+        mcpServersJSON: String = "",
         aiSystemPrompt: String = "",
         memoryWorkerEnabled: Bool = false,
         memoryWorkerEndpoint: String = "https://memory.example.com",
@@ -309,7 +342,7 @@ public struct SettingsView: View {
         onTestConnection: @escaping @MainActor () -> Void = {},
         onTestAIMemoryConnection: @escaping @MainActor () async -> String? = { nil },
         onTestAIMemoryWrite: @escaping @MainActor () async -> String? = { nil },
-        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend, String) -> Void = { _, _, _, _, _ in },
+        onSaveAIConfig: @escaping @MainActor (String, String, String, AIEngine.AIBackend, String, String) -> Void = { _, _, _, _, _, _ in },
         onSaveAIMemoryConfig: @escaping @MainActor (Bool, String, String, String, String, String, String, Int) -> Void = { _, _, _, _, _, _, _, _ in },
         onSaveNotificationConfig: @escaping @MainActor (String, Bool, Int, String) -> Void = { _, _, _, _ in },
         onUpdatePet: @escaping @MainActor (UUID, String, String, Double, String, String, String, String) -> Void = { _, _, _, _, _, _, _, _ in },
@@ -350,7 +383,10 @@ public struct SettingsView: View {
         _aiBackend = State(initialValue: aiBackend)
         _ollamaModel = State(initialValue: ollamaModel)
         _openAIApiKey = State(initialValue: openAIApiKey)
+        _mcpServersJSON = State(initialValue: mcpServersJSON)
+        _mcpServersDraft = State(initialValue: mcpServersJSON)
         _aiSystemPrompt = State(initialValue: aiSystemPrompt)
+        _aiSystemPromptDraft = State(initialValue: aiSystemPrompt)
         _memoryWorkerEnabled = State(initialValue: memoryWorkerEnabled)
         _memoryWorkerEndpoint = State(initialValue: memoryWorkerEndpoint)
         _memoryWorkerAuthMode = State(initialValue: memoryWorkerAuthMode)
@@ -1011,35 +1047,28 @@ public struct SettingsView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 6) {
+                        Text("MCP Servers (JSON)")
+                            .font(.subheadline.weight(.medium))
+                        settingsEditorButton(
+                            status: MCPSettingsSummary.statusText(for: mcpServersJSON),
+                            description: MCPSettingsSummary.descriptionText(for: mcpServersJSON),
+                            action: openMCPEditor
+                        )
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
                         Text(L10n.settingsAISystemPrompt)
                             .font(.subheadline.weight(.medium))
-                        ZStack(alignment: .topLeading) {
-                            if aiSystemPrompt.isEmpty {
-                                Text(L10n.settingsAISystemPromptPlaceholder)
-                                    .font(.body)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.top, 8)
-                                    .padding(.leading, 6)
-                                    .padding(.trailing, 6)
-                            }
-
-                            TextEditor(text: $aiSystemPrompt)
-                                .font(.body)
-                                .frame(minHeight: 96)
-                                .scrollDisabled(!AISystemPromptEditor.allowsVerticalScroll(for: aiSystemPrompt))
-                                .onChange(of: aiSystemPrompt) { _, _ in
-                                    scheduleAIConfigSave()
-                                }
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(Color.secondary.opacity(0.35))
-                                )
-                        }
+                        settingsEditorButton(
+                            status: AISystemPromptSummary.statusText(for: aiSystemPrompt),
+                            description: AISystemPromptSummary.descriptionText(for: aiSystemPrompt),
+                            action: openAISystemPromptEditor
+                        )
                     }
                 } header: {
                     Text(L10n.settingsAI)
                 } footer: {
-                    Text("配置宠物对话使用的本地或远程大模型服务。OpenAI 方式走标准 Chat Completions；API 密钥将使用 Bearer 鉴权，留空则不发送 Authorization（适合本地代理）。修改会自动保存。")
+                    Text("配置宠物对话使用的本地或远程大模型服务。OpenAI 方式走标准 Chat Completions；API 密钥将使用 Bearer 鉴权，留空则不发送 Authorization（适合本地代理）。MCP servers 支持 JSON 数组，或 { \"mcpServers\": { ... } } 对象格式；当前支持 stdio 和 streamable_http。MCP 和系统提示词需在弹窗中点保存，其余修改会自动保存。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1478,6 +1507,12 @@ public struct SettingsView: View {
         .sheet(isPresented: $showPluginCreator) {
             pluginCreatorSheet
         }
+        .sheet(isPresented: $showMCPEditor, onDismiss: resetMCPEditorDraft) {
+            mcpEditorSheet
+        }
+        .sheet(isPresented: $showAISystemPromptEditor, onDismiss: resetAISystemPromptDraft) {
+            aiSystemPromptEditorSheet
+        }
     }
 
     private var pluginCreatorSheet: some View {
@@ -1531,8 +1566,143 @@ public struct SettingsView: View {
         .frame(minWidth: 460)
     }
 
+    private var mcpEditorSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("MCP 设置")
+                    .font(.title3.weight(.semibold))
+                Text("支持 JSON 数组，或 { \"mcpServers\": { ... } } 对象格式；当前支持 stdio 和 streamable_http。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            ZStack(alignment: .topLeading) {
+                if mcpServersDraft.isEmpty {
+                    Text(MCPSettingsSummary.placeholderJSON)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 8)
+                        .padding(.leading, 6)
+                        .padding(.trailing, 6)
+                }
+
+                ScrollableTextEditor(
+                    text: $mcpServersDraft,
+                    fontStyle: .monospacedBody,
+                    wrapLines: false,
+                    showsHorizontalScroller: true,
+                    configureEditor: MCPJSONEditorConfiguration.configure
+                )
+                    .frame(minHeight: 260)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.35))
+                    )
+            }
+
+            HStack {
+                Spacer()
+
+                Button("取消") {
+                    cancelMCPEditor()
+                }
+
+                Button("保存") {
+                    saveMCPServers()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 720, minHeight: 440)
+    }
+
+    private var aiSystemPromptEditorSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L10n.settingsAISystemPrompt)
+                    .font(.title3.weight(.semibold))
+                Text("自定义系统提示词会覆盖默认引导语，留空则恢复内置默认提示词。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            ZStack(alignment: .topLeading) {
+                if aiSystemPromptDraft.isEmpty {
+                    Text(L10n.settingsAISystemPromptPlaceholder)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 8)
+                        .padding(.leading, 6)
+                        .padding(.trailing, 6)
+                }
+
+                ScrollableTextEditor(text: $aiSystemPromptDraft)
+                    .frame(minHeight: 240)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.35))
+                    )
+            }
+
+            HStack {
+                Spacer()
+
+                Button("取消") {
+                    cancelAISystemPromptEditor()
+                }
+
+                Button("保存") {
+                    saveAISystemPrompt()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 680, minHeight: 420)
+    }
+
     private var searchKeyword: String {
         settingsSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func settingsEditorButton(
+        status: String,
+        description: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(status)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.primary)
+                    Text(description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.leading)
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.secondary.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.secondary.opacity(0.18))
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private func shouldShowSection(_ section: SettingsScope) -> Bool {
@@ -1612,9 +1782,10 @@ public struct SettingsView: View {
         let prompt = aiSystemPrompt
         let backend = aiBackend
         let apiKey = openAIApiKey
+        let mcpJSON = mcpServersJSON
 
         let performSave = { [onSaveAIConfig] in
-            onSaveAIConfig(endpoint, model, prompt, backend, apiKey)
+            onSaveAIConfig(endpoint, model, prompt, backend, apiKey, mcpJSON)
         }
 
         guard !immediate else {
@@ -1627,6 +1798,61 @@ public struct SettingsView: View {
             guard !Task.isCancelled else { return }
             performSave()
         }
+    }
+
+    private func openMCPEditor() {
+        mcpServersDraft = mcpServersJSON
+        showMCPEditor = true
+    }
+
+    private func cancelMCPEditor() {
+        resetMCPEditorDraft()
+        showMCPEditor = false
+    }
+
+    private func saveMCPServers() {
+        let normalizedDraft = mcpServersDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : mcpServersDraft
+        let didChange = normalizedDraft != mcpServersJSON
+
+        mcpServersJSON = normalizedDraft
+        showMCPEditor = false
+
+        guard didChange else {
+            return
+        }
+
+        scheduleAIConfigSave(immediate: true)
+    }
+
+    private func resetMCPEditorDraft() {
+        mcpServersDraft = mcpServersJSON
+    }
+
+    private func openAISystemPromptEditor() {
+        aiSystemPromptDraft = aiSystemPrompt
+        showAISystemPromptEditor = true
+    }
+
+    private func cancelAISystemPromptEditor() {
+        resetAISystemPromptDraft()
+        showAISystemPromptEditor = false
+    }
+
+    private func saveAISystemPrompt() {
+        let didChange = aiSystemPromptDraft != aiSystemPrompt
+
+        aiSystemPrompt = aiSystemPromptDraft
+        showAISystemPromptEditor = false
+
+        guard didChange else {
+            return
+        }
+
+        scheduleAIConfigSave(immediate: true)
+    }
+
+    private func resetAISystemPromptDraft() {
+        aiSystemPromptDraft = aiSystemPrompt
     }
 
     private func scheduleNotificationConfigSave(immediate: Bool = false) {

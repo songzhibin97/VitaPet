@@ -48,6 +48,7 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertTrue(manager.config.enabledCapabilities.isEmpty)
         XCTAssertEqual(manager.config.aiBackend, "ollama")
         XCTAssertEqual(manager.config.openAIApiKey, "")
+        XCTAssertEqual(manager.config.mcpServersJSON, "")
         XCTAssertEqual(
             manager.config.locale,
             (Locale.preferredLanguages.first ?? Locale.current.identifier).hasPrefix("zh") ? "zh-Hans" : "en"
@@ -172,6 +173,7 @@ final class ConfigManagerTests: XCTestCase {
             aiBackend: "openai-compatible",
             ollamaModel: "qwen2.5",
             openAIApiKey: "sk-test",
+            mcpServersJSON: #"[{"name":"filesystem","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]"#,
             aiSystemPrompt: "Be concise",
             aiProactiveEnabled: false,
             aiProactiveInterval: 90,
@@ -203,6 +205,7 @@ final class ConfigManagerTests: XCTestCase {
         XCTAssertEqual(decoded.aiBackend, "openai-compatible")
         XCTAssertEqual(decoded.ollamaModel, "qwen2.5")
         XCTAssertEqual(decoded.openAIApiKey, "sk-test")
+        XCTAssertEqual(decoded.mcpServersJSON, #"[{"name":"filesystem","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]"#)
         XCTAssertEqual(decoded.aiSystemPrompt, "Be concise")
         XCTAssertEqual(decoded.spaceMode, "singleSpace")
         XCTAssertEqual(decoded.memoryWorkerEnabled, true)
